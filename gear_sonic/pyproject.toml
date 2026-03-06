@@ -42,6 +42,13 @@ sim = [
     "pin",
     "pyyaml",
 ]
+# Quest VR teleop via browser-based WebXR (no APK / Unity needed).
+# Requires the teleop extra as a base (ZMQ, msgpack).
+# Usage: pip install -e "gear_sonic[teleop,quest]"
+quest = [
+    "vuer",
+    "scipy",
+]
 
 [tool.setuptools.packages.find]
 where = [".."]
