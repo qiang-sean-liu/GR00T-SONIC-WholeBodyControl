@@ -148,13 +148,28 @@ def main():
           f"at {args.hz:.0f} Hz (topic={args.zmq_topic}) …")
     print("[quest_zmq_publisher] Move head / hands on the Quest to stream poses.")
 
+    waiting_logged = False
     while True:
         t0 = time.perf_counter()
 
         # Read 4x4 homogeneous pose matrices from vuer (column-major / WebXR Y-up)
-        head_mat = _GRD_YUP2GRD_ZUP @ tv.head_matrix   # → Z-up
-        lh_mat   = _GRD_YUP2GRD_ZUP @ tv.left_hand     # left wrist  → Z-up
-        rh_mat   = _GRD_YUP2GRD_ZUP @ tv.right_hand    # right wrist → Z-up
+        head_raw = tv.head_matrix
+        lh_raw   = tv.left_hand
+        rh_raw   = tv.right_hand
+
+        # Before a Quest browser connects, all matrices are zeros.
+        # Skip until at least the head matrix carries a valid rotation.
+        if np.allclose(head_raw, 0):
+            if not waiting_logged:
+                print("[quest_zmq_publisher] Waiting for Quest to connect (matrices still zero) …")
+                waiting_logged = True
+            time.sleep(dt)
+            continue
+        waiting_logged = False
+
+        head_mat = _GRD_YUP2GRD_ZUP @ head_raw
+        lh_mat   = _GRD_YUP2GRD_ZUP @ lh_raw
+        rh_mat   = _GRD_YUP2GRD_ZUP @ rh_raw
 
         head_pos, head_quat = _mat2pos_quat(head_mat)
         lh_pos,   lh_quat   = _mat2pos_quat(lh_mat)
