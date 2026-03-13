@@ -70,6 +70,16 @@ _GRD_YUP2GRD_ZUP = np.array([
 ], dtype=np.float64)
 
 
+def _has_valid_rotation(mat4x4: np.ndarray) -> bool:
+    """Return True if mat4x4's upper-left 3x3 is a valid rotation matrix (det ≈ 1).
+
+    An uninitialised shared-memory block is all zeros (det = 0).
+    A valid SE(3) pose always has det(R) = +1.
+    Using |det - 1| < 0.1 is robust to small floating-point noise.
+    """
+    return abs(np.linalg.det(mat4x4[:3, :3]) - 1.0) < 0.1
+
+
 def _mat2pos_quat(mat4x4: np.ndarray):
     """Extract position and quaternion (w, x, y, z) from a 4x4 matrix."""
     pos = mat4x4[:3, 3].copy()
@@ -96,6 +106,8 @@ def _parse_args():
     p.add_argument("--hz",            type=float, default=50.0,   help="Publish rate Hz.")
     p.add_argument("--connect-wait",  type=float, default=8.0,
                    help="Seconds to wait for Quest to connect after vuer starts.")
+    p.add_argument("--debug", action="store_true",
+                   help="Print raw matrix determinants every second to diagnose connection issues.")
     return p.parse_args()
 
 
@@ -149,6 +161,7 @@ def main():
     print("[quest_zmq_publisher] Move head / hands on the Quest to stream poses.")
 
     waiting_logged = False
+    debug_t = time.perf_counter()
     while True:
         t0 = time.perf_counter()
 
@@ -157,15 +170,45 @@ def main():
         lh_raw   = tv.left_hand
         rh_raw   = tv.right_hand
 
-        # Before a Quest browser connects, all matrices are zeros.
-        # Skip until at least the head matrix carries a valid rotation.
-        if np.allclose(head_raw, 0):
+        if args.debug and (t0 - debug_t) >= 1.0:
+            debug_t = t0
+            print(f"[debug] subprocess pid={tv.process.pid}  alive={tv.process.is_alive()}  exitcode={tv.process.exitcode}")
+            print(f"[debug] head det={np.linalg.det(head_raw[:3,:3]):.3f}  "
+                  f"lh det={np.linalg.det(lh_raw[:3,:3]):.3f}  "
+                  f"rh det={np.linalg.det(rh_raw[:3,:3]):.3f}")
+            print(f"[debug] head[0]={head_raw[0].tolist()}")
+            print(f"[debug] lh[0]  ={lh_raw[0].tolist()}")
+
+        # Guard: wait until at least one matrix has a valid rotation (det ≈ 1).
+        #
+        # Why not np.allclose(head_raw, 0)?
+        #   on_cam_move (CAMERA_MOVE) only fires when the headset physically moves.
+        #   on_hand_move (HAND_MOVE) fires independently as soon as hands are tracked.
+        #   Either event arriving means the XR session is live — accept either one.
+        #   A zero rotation matrix has det = 0; a valid SE(3) pose has det(R) = +1.
+        head_valid = _has_valid_rotation(head_raw)
+        lh_valid   = _has_valid_rotation(lh_raw)
+        rh_valid   = _has_valid_rotation(rh_raw)
+
+        if not (head_valid or lh_valid or rh_valid):
             if not waiting_logged:
-                print("[quest_zmq_publisher] Waiting for Quest to connect (matrices still zero) …")
+                print("[quest_zmq_publisher] Waiting for XR session data "
+                      "(open the URL in the Quest browser, enter VR mode, "
+                      "then move your head or hands) …")
                 waiting_logged = True
             time.sleep(dt)
             continue
         waiting_logged = False
+
+        # Use identity pose for any tracker not yet reporting valid data.
+        # This is safe in VR_3PT: SONIC calibrates wrists on entry, so a
+        # brief identity pose before hands are tracked causes no harm.
+        if not head_valid:
+            head_raw = np.eye(4)
+        if not lh_valid:
+            lh_raw = np.eye(4)
+        if not rh_valid:
+            rh_raw = np.eye(4)
 
         head_mat = _GRD_YUP2GRD_ZUP @ head_raw
         lh_mat   = _GRD_YUP2GRD_ZUP @ lh_raw

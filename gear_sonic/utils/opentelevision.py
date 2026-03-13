@@ -22,8 +22,24 @@ from multiprocessing import Array, Process, Value, shared_memory
 
 import numpy as np
 
+# Monkey-patch aiohttp's BaseProtocol.resume_writing to work around an
+# AssertionError ("assert self._paused") in aiohttp >=3.13 with Python 3.10
+# SSL transports.  The assertion fires when the SSL transport calls
+# resume_writing before the protocol has been paused, which is harmless
+# but crashes the WebSocket connection.
+try:
+    import aiohttp.base_protocol as _abp
+    _orig_resume_writing = _abp.BaseProtocol.resume_writing
+    def _safe_resume_writing(self):
+        if not getattr(self, "_paused", False):
+            return
+        _orig_resume_writing(self)
+    _abp.BaseProtocol.resume_writing = _safe_resume_writing
+except Exception:
+    pass
+
 from vuer import Vuer
-from vuer.schemas import DefaultScene, Hands, MotionControllers, WebRTCStereoVideoPlane
+from vuer.schemas import DefaultScene, Hands, Head, MotionControllers, WebRTCStereoVideoPlane
 
 
 class OpenTeleVision:
@@ -44,8 +60,8 @@ class OpenTeleVision:
         self.right_hand_shared = Array('d', 16, lock=True)
         self.left_landmarks_shared = Array('d', 75, lock=True)
         self.right_landmarks_shared = Array('d', 75, lock=True)
-        self.left_controller_state_shared = Array('d', 7, lock=True)  # trigger, squeeze, thumbstick_x, thumbstick_y, thumbstick, a_button, b_button
-        self.right_controller_state_shared = Array('d', 7, lock=True)  # trigger, squeeze, thumbstick_x, thumbstick_y, thumbstick, a_button, b_button
+        self.left_controller_state_shared = Array('d', 7, lock=True)
+        self.right_controller_state_shared = Array('d', 7, lock=True)
 
         self.head_matrix_shared = Array('d', 16, lock=True)
         self.aspect_shared = Value('d', 1.0, lock=True)
@@ -55,6 +71,18 @@ class OpenTeleVision:
         self.process.start()
 
     def run(self):
+        import sys
+        _log = open("/tmp/opentelevision_subprocess.log", "w", buffering=1)
+        sys.stdout = _log
+        sys.stderr = _log
+        try:
+            self._run_inner()
+        except Exception:
+            traceback.print_exc()
+            raise
+
+    def _run_inner(self):
+        print(f"[OpenTeleVision] subprocess started, device_type={self.device_type}", flush=True)
         if self.ngrok:
             self.app = Vuer(host='0.0.0.0', queries=dict(grid=False), queue_len=3)
         else:
@@ -66,6 +94,11 @@ class OpenTeleVision:
             self.app.add_handler("CONTROLLER_MOVE")(self.on_motion_controller_move)
         else:
             raise ValueError("device_type must be either 'hand' or 'controller'")
+
+        # HEAD_MOVE fires in VR mode via XRFrame.getViewerPose (the Head component).
+        # CAMERA_MOVE fires in flat/desktop mode via OrbitControls.
+        # Register both so head tracking works in either mode.
+        self.app.add_handler("HEAD_MOVE")(self.on_head_move)
         self.app.add_handler("CAMERA_MOVE")(self.on_cam_move)
 
         if self.stream_mode == "image":
@@ -81,12 +114,26 @@ class OpenTeleVision:
         print("closing tv")
         self.process.kill()
 
-    async def on_cam_move(self, event, session, fps=60):
+    async def on_head_move(self, event, session, fps=60):
+        """HEAD_MOVE fires in VR mode from the Head component (XRFrame.getViewerPose)."""
         try:
-            self.head_matrix_shared[:] = event.value["camera"]["matrix"]
-            self.aspect_shared.value = event.value['camera']['aspect']
+            matrix = event.value.get("matrix") if isinstance(event.value, dict) else None
+            if matrix is not None and isinstance(matrix, list) and len(matrix) == 16:
+                self.head_matrix_shared[:] = matrix
+                print(f"[on_head_move] got head matrix, pos=({matrix[12]:.3f}, {matrix[13]:.3f}, {matrix[14]:.3f})")
         except Exception as e:
-            print(f"on cam move error: {e}. event.value=\n{event.value}")
+            print(f"on_head_move error: {e}")
+
+    async def on_cam_move(self, event, session, fps=60):
+        """CAMERA_MOVE fires in flat/desktop mode from OrbitControls."""
+        try:
+            if isinstance(event.value, dict) and "camera" in event.value:
+                self.head_matrix_shared[:] = event.value["camera"]["matrix"]
+                self.aspect_shared.value = event.value['camera']['aspect']
+            elif isinstance(event.value, dict) and "matrix" in event.value:
+                self.head_matrix_shared[:] = event.value["matrix"]
+        except Exception as e:
+            print(f"on_cam_move error: {e}")
 
     async def on_motion_controller_move(self, event, session, fps=60):
         if "right" in event.value:
@@ -112,31 +159,54 @@ class OpenTeleVision:
         controller_state_shared[:] = np.array(values)
 
     def _parse_hand_data(self, value, side, hand_shared, landmarks_shared=None):
-        data = value[side]
-        if not isinstance(data, list):
-            # when the hand is not detected, the data is not a list.
+        if side not in value:
             return
-        data = np.array(data)
+        data = value[side]
+        # vuer >= 0.1.5: Float32Array arrives as msgpack ExtType (raw bytes).
+        # Older vuer: arrives as a Python list of floats.
+        if hasattr(data, 'data'):  # msgpack.ExtType
+            raw = data.data
+            if len(raw) < 64:  # need at least 16 floats (4x4 wrist matrix) = 64 bytes
+                return
+            data = np.frombuffer(raw, dtype=np.float32).astype(np.float64)
+        elif isinstance(data, list):
+            data = np.array(data)
+        else:
+            return
+        if len(data) < 16:
+            return
         hand_shared[:] = data[:16]
-        if landmarks_shared is not None:
-            data = data.reshape(25, 4, 4).transpose(0, 2, 1)
-            landmarks_shared[:] = data[:, :3, 3].flatten()  # only use the position
+        if landmarks_shared is not None and len(data) >= 400:
+            data[:400].reshape(25, 4, 4).transpose(0, 2, 1)
+            landmarks_shared[:] = data[:400].reshape(25, 4, 4).transpose(0, 2, 1)[:, :3, 3].flatten()
+
+    _hand_log_counter = 0
 
     async def on_hand_move(self, event, session, fps=60):
+        self._hand_log_counter = getattr(self, '_hand_log_counter', 0) + 1
+        if self._hand_log_counter <= 5 or self._hand_log_counter % 300 == 0:
+            all_keys = list(event.__dict__.keys())
+            val_keys = list(event.value.keys()) if isinstance(event.value, dict) else type(event.value).__name__
+            print(f"[on_hand_move #{self._hand_log_counter}] event_keys={all_keys} value_keys={val_keys}")
+            if self._hand_log_counter <= 3:
+                # Print raw event dict so we can see where data actually lives
+                print(f"  raw event.__dict__={str(event.__dict__)[:600]}")
+
         try:
             self._parse_hand_data(event.value, "left", self.left_hand_shared, self.left_landmarks_shared)
         except Exception as e:
             traceback.print_exc()
-            print(f"on left hand move error: {e}. event.value=\n{event.value}")
+            print(f"on left hand move error: {e}")
         try:
             self._parse_hand_data(event.value, "right", self.right_hand_shared, self.right_landmarks_shared)
         except Exception as e:
             traceback.print_exc()
-            print(f"on right hand move error: {e}. event.value=\n{event.value}")
+            print(f"on right hand move error: {e}")
 
     async def main_webrtc(self, session, fps=60):
         session.set @ DefaultScene(frameloop="always")
         session.upsert @ Hands(fps=fps, stream=True, key="hands", showLeft=False, showRight=False)
+        session.upsert @ Head(stream=True, fps=fps, key="head_tracking")
         session.upsert @ WebRTCStereoVideoPlane(
             src="https://192.168.8.102:8080/offer",
             key="zed",
@@ -148,6 +218,10 @@ class OpenTeleVision:
             await asyncio.sleep(1)
 
     async def main_image(self, session, fps=60):
+        print(f"[main_image] session started, device_type={self.device_type}", flush=True)
+        session.set @ DefaultScene(frameloop="always")
+        # Head component uses XRFrame.getViewerPose -> HEAD_MOVE events (works in VR mode).
+        session.upsert @ Head(stream=True, fps=fps, key="head_tracking")
         if self.device_type == "hand":
             session.upsert @ Hands(fps=fps, stream=True, key="hands")
         elif self.device_type == "controller":
@@ -155,6 +229,7 @@ class OpenTeleVision:
             # NOTE: Two controllers simultaneously is only supported on PICO.
             # On Quest, adding a second MotionControllers element freezes the browser.
             session.upsert @ MotionControllers(stream=True, key="motion-controller-left", left=True)
+        print("[main_image] scene components sent. Waiting for Quest to enter VR mode...")
         while True:
             await asyncio.sleep(0.03)
 

@@ -6,12 +6,11 @@
 echo "🔧 Setting up G1 Deploy environment..."
 
 # Run jetson_clocks on Jetson systems (bare-metal only)
-if command -v jetson_clocks &> /dev/null; then
+# Only run on actual Jetson hardware (check for Tegra release file)
+if command -v jetson_clocks &> /dev/null && [ -f "/etc/nv_tegra_release" ]; then
     if [ -f "/.dockerenv" ]; then
-        # Inside Docker - skip (jetson_clocks needs host access)
         echo "ℹ️  Inside Docker - jetson_clocks should be run on host"
     else
-        # Bare-metal Jetson - set max performance
         echo "🚀 Setting Jetson to max performance..."
         sudo jetson_clocks 2>/dev/null || echo "⚠️  jetson_clocks failed (needs sudo)"
     fi
@@ -301,19 +300,8 @@ if [ -d "/opt/onnxruntime/lib" ]; then
     export LD_LIBRARY_PATH="/opt/onnxruntime/lib:$LD_LIBRARY_PATH"
 fi
 
-# Set up Git LFS (if not already done)
-if command -v git-lfs &> /dev/null; then
-    git lfs install &> /dev/null
-    echo "✅ Git LFS configured"
-    
-    # Pull large files if in git repository
-    if [ -d ".git" ]; then
-        echo "📥 Pulling Git LFS files..."
-        git lfs pull
-    fi
-else
-    echo "⚠️  Git LFS not found. Please install git-lfs package."
-fi
+# Git LFS: run 'git lfs pull' manually to download large model files.
+# (Skipped here to avoid blocking env setup.)
 
 # Verify essential tools
 echo ""
