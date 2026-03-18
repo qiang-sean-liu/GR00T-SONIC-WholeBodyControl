@@ -40,9 +40,13 @@ Options
 """
 
 import argparse
+import json
 import multiprocessing
+import socket
 import time
+import urllib.request
 from multiprocessing import shared_memory
+from pathlib import Path
 
 import msgpack
 import numpy as np
@@ -50,6 +54,10 @@ import zmq
 from scipy.spatial.transform import Rotation as R
 
 from gear_sonic.utils.opentelevision import OpenTeleVision
+from gear_sonic.utils.teleop.zmq.zmq_planner_sender import build_command_message, build_planner_message
+
+# Repo root = two levels up from this script (gear_sonic/scripts/quest_zmq_publisher.py)
+_REPO_ROOT = Path(__file__).resolve().parents[2]
 
 # ---------------------------------------------------------------------------
 # Coordinate frame conversion
@@ -99,8 +107,8 @@ def _parse_args():
     p = argparse.ArgumentParser(description="Meta Quest → SONIC ZMQ bridge")
     p.add_argument("--ngrok", action=argparse.BooleanOptionalAction, default=True,
                    help="Use ngrok tunnel (default: True). Disable for same-WiFi + cert.")
-    p.add_argument("--cert", default="./cert.pem", help="TLS cert PEM path.")
-    p.add_argument("--key",  default="./key.pem",  help="TLS key PEM path.")
+    p.add_argument("--cert", default=str(_REPO_ROOT / "cert.pem"), help="TLS cert PEM path.")
+    p.add_argument("--key",  default=str(_REPO_ROOT / "key.pem"),  help="TLS key PEM path.")
     p.add_argument("--zmq-port",      type=int,   default=5556,   help="ZMQ PUB port.")
     p.add_argument("--zmq-topic",     type=str,   default="pose", help="ZMQ topic.")
     p.add_argument("--hz",            type=float, default=50.0,   help="Publish rate Hz.")
@@ -108,19 +116,52 @@ def _parse_args():
                    help="Seconds to wait for Quest to connect after vuer starts.")
     p.add_argument("--debug", action="store_true",
                    help="Print raw matrix determinants every second to diagnose connection issues.")
+    p.add_argument("--quest-cam", action="store_true", default=False,
+                   help="Stream MuJoCo head_camera frames to Quest. "
+                        "Requires run_sim_loop.py --quest-cam to be running.")
     return p.parse_args()
 
 
 def main():
     args = _parse_args()
 
+    if not args.ngrok:
+        for fpath in (args.cert, args.key):
+            if not Path(fpath).exists():
+                raise FileNotFoundError(
+                    f"TLS file not found: {fpath}\n"
+                    "Generate it with:\n"
+                    "  openssl req -x509 -newkey rsa:4096 -keyout key.pem -out cert.pem "
+                    "-days 365 -nodes -subj '/CN=localhost'"
+                )
+
     # ------------------------------------------------------------------
-    # Shared memory stub required by OpenTeleVision even when image
-    # streaming is unused (stream_mode="image" is the default; the image
-    # array is simply never written by quest_zmq_publisher).
+    # Shared memory for image streaming.
+    # --quest-cam: attach to the named block "quest_head_cam" that
+    #   run_sim_loop.py creates and fills with head_camera frames.
+    # default: create an anonymous block (never written — blank image).
     # ------------------------------------------------------------------
+    _QUEST_CAM_SHM_NAME = "quest_head_cam"
     img_shape = (480, 640, 3)
-    shm = shared_memory.SharedMemory(create=True, size=int(np.prod(img_shape)))
+    if args.quest_cam:
+        # Wait for the sim to create the named block (up to 30 s).
+        shm = None
+        print("[quest_zmq_publisher] --quest-cam: waiting for sim to create 'quest_head_cam' shm …")
+        deadline = time.time() + 30
+        while time.time() < deadline:
+            try:
+                shm = shared_memory.SharedMemory(name=_QUEST_CAM_SHM_NAME)
+                print(f"[quest_zmq_publisher] Opened 'quest_head_cam' shm ({img_shape[0]}x{img_shape[1]})")
+                break
+            except FileNotFoundError:
+                time.sleep(0.5)
+        if shm is None:
+            raise RuntimeError(
+                "Timed out waiting for 'quest_head_cam' shared memory. "
+                "Make sure run_sim_loop.py is running with --quest-cam."
+            )
+    else:
+        shm = shared_memory.SharedMemory(create=True, size=int(np.prod(img_shape)))
 
     # ------------------------------------------------------------------
     # Start vuer WebXR server in a daemon subprocess.
@@ -139,11 +180,40 @@ def main():
 
     print(f"[quest_zmq_publisher] vuer WebXR server started.")
     if args.ngrok:
-        print("[quest_zmq_publisher] ngrok tunnel active — check above for the public URL.")
+        # vuer prints the ngrok URL to the subprocess log. Scan it for an https://...ngrok URL.
+        import re
+        vuer_url = None
+        deadline = time.time() + 20
+        print("[quest_zmq_publisher] Waiting for ngrok tunnel URL …", flush=True)
+        while time.time() < deadline:
+            time.sleep(1)
+            try:
+                with open("/tmp/opentelevision_subprocess.log") as f:
+                    for line in f:
+                        m = re.search(r'(https://[^\s]*ngrok[^\s]*)', line)
+                        if m:
+                            vuer_url = m.group(1)
+            except FileNotFoundError:
+                pass
+            if vuer_url:
+                break
+        if vuer_url:
+            print(f"[quest_zmq_publisher] Open in Quest browser: {vuer_url}")
+        else:
+            print("[quest_zmq_publisher] Could not find ngrok URL — check /tmp/opentelevision_subprocess.log")
     else:
-        print("[quest_zmq_publisher] Same-WiFi mode — open https://<workstation-ip>:8012 on Quest.")
-    print(f"[quest_zmq_publisher] Waiting {args.connect_wait:.0f} s for Quest browser to connect …")
-    time.sleep(args.connect_wait)
+        # Detect the local IP that would be reachable from the Quest.
+        try:
+            s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            s.connect(("8.8.8.8", 80))
+            local_ip = s.getsockname()[0]
+            s.close()
+        except Exception:
+            local_ip = "<workstation-ip>"
+        print(f"[quest_zmq_publisher] Same-WiFi mode — open https://{local_ip}:8012 on Quest.")
+    if not args.ngrok:
+        print(f"[quest_zmq_publisher] Waiting {args.connect_wait:.0f} s for Quest browser to connect …")
+        time.sleep(args.connect_wait)
 
     # ------------------------------------------------------------------
     # ZMQ publisher — SONIC deploy.sh subscribes here.
@@ -153,12 +223,44 @@ def main():
     pub.bind(f"tcp://*:{args.zmq_port}")
     topic = args.zmq_topic.encode()
 
+    def _send_command(start: bool, stop: bool, planner: bool):
+        # build_command_message returns: b"command" + 1280-byte JSON header + binary payload
+        pub.send(build_command_message(start=start, stop=stop, planner=planner))
+
+    def _command_input_thread():
+        """Background thread: read keypresses and send ZMQ command messages."""
+        import sys, tty, termios
+        fd = sys.stdin.fileno()
+        old = termios.tcgetattr(fd)
+        try:
+            tty.setraw(fd)
+            while True:
+                ch = sys.stdin.read(1)
+                if ch in (']', 's', 'S'):
+                    _send_command(start=True, stop=False, planner=True)
+                    print("\r[quest_zmq_publisher] START sent → robot should stand up", flush=True)
+                elif ch in ('o', 'O'):
+                    _send_command(start=False, stop=True, planner=False)
+                    print("\r[quest_zmq_publisher] STOP sent → emergency stop", flush=True)
+                elif ch in ('p', 'P'):
+                    _send_command(start=False, stop=False, planner=True)
+                    print("\r[quest_zmq_publisher] PLANNER mode sent", flush=True)
+                elif ch == '\x03':  # Ctrl-C
+                    break
+        finally:
+            termios.tcsetattr(fd, termios.TCSADRAIN, old)
+
+    import threading
+    _t = threading.Thread(target=_command_input_thread, daemon=True)
+    _t.start()
+
     dt = 1.0 / args.hz
     frame_idx = 0
 
     print(f"[quest_zmq_publisher] Publishing ZMQ Protocol v3 on port {args.zmq_port} "
           f"at {args.hz:.0f} Hz (topic={args.zmq_topic}) …")
     print("[quest_zmq_publisher] Move head / hands on the Quest to stream poses.")
+    print("[quest_zmq_publisher] Keys: ] or S = START  |  O = STOP  |  P = PLANNER  |  V = VR_3PT")
 
     waiting_logged = False
     debug_t = time.perf_counter()
@@ -218,21 +320,20 @@ def main():
         lh_pos,   lh_quat   = _mat2pos_quat(lh_mat)
         rh_pos,   rh_quat   = _mat2pos_quat(rh_mat)
 
-        # Protocol v3 message.
-        # Only vr_position and vr_orientation are consumed by VR_3PT mode.
-        # All lower-body fields are zeroed; the planner drives legs from joystick.
-        msg = {
-            "vr_position":    np.array([[head_pos, lh_pos, rh_pos]]),    # [1, 3, 3]
-            "vr_orientation": np.array([[head_quat, lh_quat, rh_quat]]), # [1, 3, 4]  w,x,y,z
-            "body_quat":      head_quat.reshape(1, 4),                   # [1, 4]
-            "frame_index":    np.array([frame_idx]),
-            # Unused in VR_3PT — zeroed to satisfy the protocol schema
-            "joint_pos":   np.zeros((1, 29)),
-            "joint_vel":   np.zeros((1, 29)),
-            "smpl_joints": np.zeros((1, 24, 3)),
-            "smpl_pose":   np.zeros((1, 21, 3)),
-        }
-        pub.send_multipart([topic, msgpack.packb(msg, default=_encode_ndarray)])
+        # Send planner message with VR_3PT tracking data embedded.
+        # The ZMQManager reads vr_position / vr_orientation from the planner
+        # topic and uses them to drive the robot's upper body in VR_3PT mode.
+        # vr_position:    flat f32[9]  = [head_xyz, lh_xyz, rh_xyz]
+        # vr_orientation: flat f32[12] = [head_wxyz, lh_wxyz, rh_wxyz]
+        vr_pos = np.concatenate([head_pos, lh_pos, rh_pos]).astype(np.float32)
+        vr_ori = np.concatenate([head_quat, lh_quat, rh_quat]).astype(np.float32)
+        pub.send(build_planner_message(
+            mode=0,                     # Idle — no locomotion by default
+            movement=[0.0, 0.0, 0.0],
+            facing=[1.0, 0.0, 0.0],
+            vr_3pt_position=vr_pos.tolist(),
+            vr_3pt_orientation=vr_ori.tolist(),
+        ))
         frame_idx += 1
 
         elapsed = time.perf_counter() - t0

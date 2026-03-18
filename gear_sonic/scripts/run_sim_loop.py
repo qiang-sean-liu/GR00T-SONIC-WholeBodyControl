@@ -45,12 +45,20 @@ def main(config: ArgsConfig):
 
     robot_model = instantiate_g1_robot_model()
 
+    quest_cam_kwargs = {}
+    if config.quest_cam:
+        quest_cam_kwargs = {
+            "camera_configs": {"head_camera": {"height": 480, "width": 640}},
+            "quest_cam_shm_name": "quest_head_cam",
+        }
+
     sim_wrapper = SimWrapper(
         robot_model=robot_model,
         env_name=config.env_name,
         config=wbc_config,
         onscreen=wbc_config.get("ENABLE_ONSCREEN", True),
-        offscreen=wbc_config.get("ENABLE_OFFSCREEN", False),
+        offscreen=wbc_config.get("ENABLE_OFFSCREEN", False) or config.quest_cam,
+        **quest_cam_kwargs,
     )
     # Start simulator as independent process
     SimulatorFactory.start_simulator(

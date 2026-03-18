@@ -39,7 +39,7 @@ except Exception:
     pass
 
 from vuer import Vuer
-from vuer.schemas import DefaultScene, Hands, Head, MotionControllers, WebRTCStereoVideoPlane
+from vuer.schemas import DefaultScene, Hands, Head, ImageBackground, MotionControllers, WebRTCStereoVideoPlane
 
 
 class OpenTeleVision:
@@ -82,11 +82,16 @@ class OpenTeleVision:
             raise
 
     def _run_inner(self):
-        print(f"[OpenTeleVision] subprocess started, device_type={self.device_type}", flush=True)
+        print(f"[OpenTeleVision] subprocess started, device_type={self.device_type}, ngrok={self.ngrok}", flush=True)
         if self.ngrok:
             self.app = Vuer(host='0.0.0.0', queries=dict(grid=False), queue_len=3)
         else:
-            self.app = Vuer(host='0.0.0.0', cert=self.cert_file, key=self.key_file, queries=dict(grid=False), queue_len=3)
+            self.app = Vuer(host='0.0.0.0', queries=dict(grid=False), queue_len=3)
+            # EnvVar descriptors cache None at import time; write directly to the
+            # instance __dict__ to bypass the descriptor on subsequent reads.
+            self.app.__dict__["cert"] = self.cert_file
+            self.app.__dict__["key"] = self.key_file
+            print(f"[OpenTeleVision] TLS cert={self.app.cert}  key={self.app.key}", flush=True)
 
         if self.device_type == "hand":
             self.app.add_handler("HAND_MOVE")(self.on_hand_move)
@@ -230,8 +235,29 @@ class OpenTeleVision:
             # On Quest, adding a second MotionControllers element freezes the browser.
             session.upsert @ MotionControllers(stream=True, key="motion-controller-left", left=True)
         print("[main_image] scene components sent. Waiting for Quest to enter VR mode...")
+
+        _frame_interval = 1.0 / 30.0  # 30 Hz image stream
+        _encode_errors = 0
         while True:
-            await asyncio.sleep(0.03)
+            t0 = asyncio.get_event_loop().time()
+            try:
+                frame = self.img_array.copy()
+                if np.any(frame):  # skip blank (all-zero) frames until sim starts rendering
+                    # Pass numpy array directly; vuer encodes it as JPEG internally.
+                    session.upsert @ ImageBackground(
+                        frame,
+                        format="jpeg",
+                        quality=75,
+                        key="head_cam",
+                    )
+                    _encode_errors = 0
+            except Exception as e:
+                _encode_errors += 1
+                if _encode_errors <= 3 or _encode_errors % 100 == 0:
+                    print(f"[main_image] frame encode error #{_encode_errors}: {e}", flush=True)
+
+            elapsed = asyncio.get_event_loop().time() - t0
+            await asyncio.sleep(max(0.0, _frame_interval - elapsed))
 
     @property
     def left_hand(self):

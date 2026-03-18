@@ -40,6 +40,7 @@ class DefaultEnv:
         onscreen: bool = False,
         offscreen: bool = False,
         enable_image_publish: bool = False,
+        quest_cam_shm_name: str = "",
     ):
         self.config = config
         self.env_name = env_name
@@ -64,6 +65,29 @@ class DefaultEnv:
             self.init_renderers()
         self.image_dt = self.config.get("IMAGE_DT", 0.033333)
         self.image_publish_process = None
+
+        # Named shared memory for streaming head_camera frames to Quest.
+        self.quest_cam_shm = None
+        self.quest_cam_shm_array = None
+        if quest_cam_shm_name and "head_camera" in camera_configs:
+            from multiprocessing import shared_memory as _shm_mod
+            cam_cfg = camera_configs["head_camera"]
+            h, w = cam_cfg["height"], cam_cfg["width"]
+            size = h * w * 3
+            # Unlink stale block from a previous crash before creating.
+            try:
+                _stale = _shm_mod.SharedMemory(name=quest_cam_shm_name)
+                _stale.close()
+                _stale.unlink()
+            except Exception:
+                pass
+            self.quest_cam_shm = _shm_mod.SharedMemory(
+                name=quest_cam_shm_name, create=True, size=size
+            )
+            self.quest_cam_shm_array = np.ndarray(
+                (h, w, 3), dtype=np.uint8, buffer=self.quest_cam_shm.buf
+            )
+            print(f"[DefaultEnv] quest_cam shm '{quest_cam_shm_name}' created ({h}x{w})", flush=True)
 
     def start_image_publish_subprocess(self, start_method: str = "spawn", camera_port: int = 5555):
         from gear_sonic.utils.mujoco_sim.image_publish_utils import ImagePublishProcess
@@ -485,6 +509,12 @@ class DefaultEnv:
         if self.image_publish_process is not None:
             self.image_publish_process.update_shared_memory(render_caches)
 
+        if self.quest_cam_shm_array is not None and "head_camera_image" in render_caches:
+            img = render_caches["head_camera_image"]
+            if img.dtype != np.uint8:
+                img = (img * 255).astype(np.uint8)
+            np.copyto(self.quest_cam_shm_array, img)
+
         return render_caches
 
     def handle_keyboard_button(self, key):
@@ -642,6 +672,10 @@ class BaseSimulator:
                 self.sim_env.image_publish_process.stop()
             if self.sim_env.viewer is not None:
                 self.sim_env.viewer.close()
+            if self.sim_env.quest_cam_shm is not None:
+                self.sim_env.quest_cam_shm.close()
+                self.sim_env.quest_cam_shm.unlink()
+                self.sim_env.quest_cam_shm = None
         except Exception as e:
             print(f"Warning during close: {e}")
 
