@@ -40,6 +40,7 @@ class DefaultEnv:
         onscreen: bool = False,
         offscreen: bool = False,
         enable_image_publish: bool = False,
+        head_cam_shm_name: str = "",
     ):
         self.config = config
         self.env_name = env_name
@@ -64,6 +65,48 @@ class DefaultEnv:
             self.init_renderers()
         self.image_dt = self.config.get("IMAGE_DT", 0.033333)
         self.image_publish_process = None
+
+        # Named shared memory for streaming head_camera frames to PICO/Quest via vuer.
+        self.head_cam_shm = None
+        self.head_cam_shm_array = None
+        # Stereo mode: camera_configs has head_camera_left + head_camera_right.
+        # Mono mode: camera_configs has head_camera.
+        _stereo = (
+            head_cam_shm_name
+            and "head_camera_left" in camera_configs
+            and "head_camera_right" in camera_configs
+        )
+        _mono = head_cam_shm_name and "head_camera" in camera_configs and not _stereo
+        self.head_cam_stereo = _stereo
+        if _stereo or _mono:
+            from multiprocessing import shared_memory as _shm_mod
+            if _stereo:
+                cam_cfg = camera_configs["head_camera_left"]
+                h, w = cam_cfg["height"], cam_cfg["width"]
+                shm_w = w * 2  # side-by-side: left | right
+            else:
+                cam_cfg = camera_configs["head_camera"]
+                h, w = cam_cfg["height"], cam_cfg["width"]
+                shm_w = w
+            size = h * shm_w * 3
+            try:  # unlink stale block from a previous crash
+                _stale = _shm_mod.SharedMemory(name=head_cam_shm_name)
+                _stale.close()
+                _stale.unlink()
+            except Exception:
+                pass
+            self.head_cam_shm = _shm_mod.SharedMemory(name=head_cam_shm_name, create=True, size=size)
+            # Unregister from Python's resource tracker so it is NOT auto-unlinked
+            # when subprocesses (viewer, image-publish) fork/spawn — we manage
+            # lifetime explicitly in close().
+            try:
+                from multiprocessing import resource_tracker as _rt
+                _rt.unregister(f"/{head_cam_shm_name}", "shared_memory")
+            except Exception:
+                pass
+            self.head_cam_shm_array = np.ndarray((h, shm_w, 3), dtype=np.uint8, buffer=self.head_cam_shm.buf)
+            mode = "stereo" if _stereo else "mono"
+            print(f"[DefaultEnv] head_cam shm '{head_cam_shm_name}' created ({h}x{shm_w}, {mode})", flush=True)
 
     def start_image_publish_subprocess(self, start_method: str = "spawn", camera_port: int = 5555):
         from gear_sonic.utils.mujoco_sim.image_publish_utils import ImagePublishProcess
@@ -177,6 +220,7 @@ class DefaultEnv:
                 )
 
         # Enable the elastic band
+        self.elastic_band = None
         if self.config["ENABLE_ELASTIC_BAND"] and self.use_floating_root_link:
             self.elastic_band = ElasticBand()
             if "g1" in self.config["ROBOT_TYPE"]:
@@ -193,7 +237,7 @@ class DefaultEnv:
                 self.viewer = mujoco.viewer.launch_passive(
                     self.mj_model,
                     self.mj_data,
-                    key_callback=self.elastic_band.MujuocoKeyCallback,
+                    key_callback=self._glfw_key_callback,
                     show_left_ui=False,
                     show_right_ui=False,
                 )
@@ -203,7 +247,9 @@ class DefaultEnv:
         else:
             if self.onscreen:
                 self.viewer = mujoco.viewer.launch_passive(
-                    self.mj_model, self.mj_data, show_left_ui=False, show_right_ui=False
+                    self.mj_model, self.mj_data,
+                    key_callback=self._glfw_key_callback,
+                    show_left_ui=False, show_right_ui=False
                 )
             else:
                 mujoco.mj_forward(self.mj_model, self.mj_data)
@@ -245,6 +291,10 @@ class DefaultEnv:
     def init_renderers(self):
         self.renderers = {}
         for camera_name, camera_config in self.camera_configs.items():
+            cam_id = mujoco.mj_name2id(self.mj_model, mujoco.mjtObj.mjOBJ_CAMERA, camera_name)
+            if cam_id == -1:
+                print(f"[DefaultEnv] Warning: camera '{camera_name}' not found in model, skipping.")
+                continue
             renderer = mujoco.Renderer(
                 self.mj_model, height=camera_config["height"], width=camera_config["width"]
             )
@@ -453,10 +503,22 @@ class DefaultEnv:
 
     def update_viewer_camera(self):
         if self.viewer is not None:
-            if self.viewer.cam.type == mujoco.mjtCamera.mjCAMERA_TRACKING:
+            # Cycle: TRACKING -> FREE -> FIXED (head_camera) -> TRACKING
+            try:
+                head_cam_id = self.mj_model.camera("head_camera").id
+                has_head_cam = True
+            except Exception:
+                has_head_cam = False
+
+            cur = self.viewer.cam.type
+            if cur == mujoco.mjtCamera.mjCAMERA_TRACKING:
                 self.viewer.cam.type = mujoco.mjtCamera.mjCAMERA_FREE
+            elif cur == mujoco.mjtCamera.mjCAMERA_FREE and has_head_cam:
+                self.viewer.cam.type = mujoco.mjtCamera.mjCAMERA_FIXED
+                self.viewer.cam.fixedcamid = head_cam_id
             else:
                 self.viewer.cam.type = mujoco.mjtCamera.mjCAMERA_TRACKING
+                self.viewer.cam.trackbodyid = self.mj_model.body("pelvis").id
 
     def update_reward(self):
         with self.reward_lock:
@@ -475,7 +537,9 @@ class DefaultEnv:
     def update_render_caches(self):
         render_caches = {}
         for camera_name, camera_config in self.camera_configs.items():
-            renderer = self.renderers[camera_name]
+            renderer = self.renderers.get(camera_name)
+            if renderer is None:
+                continue
             if "params" in camera_config:
                 renderer.update_scene(self.mj_data, camera=camera_config["params"])
             else:
@@ -485,7 +549,39 @@ class DefaultEnv:
         if self.image_publish_process is not None:
             self.image_publish_process.update_shared_memory(render_caches)
 
+        if self.head_cam_shm_array is not None:
+            if self.head_cam_stereo:
+                left  = render_caches.get("head_camera_left_image")
+                right = render_caches.get("head_camera_right_image")
+                if left is not None and right is not None:
+                    if left.dtype != np.uint8:
+                        left = (left * 255).astype(np.uint8)
+                    if right.dtype != np.uint8:
+                        right = (right * 255).astype(np.uint8)
+                    np.copyto(self.head_cam_shm_array, np.hstack([left, right]))
+            elif "head_camera_image" in render_caches:
+                img = render_caches["head_camera_image"]
+                if img.dtype != np.uint8:
+                    img = (img * 255).astype(np.uint8)
+                np.copyto(self.head_cam_shm_array, img)
+
         return render_caches
+
+    def _glfw_key_callback(self, keycode):
+        import glfw
+        if self.elastic_band:
+            self.elastic_band.MujuocoKeyCallback(keycode)
+        _MAP = {
+            glfw.KEY_V: "v",
+            glfw.KEY_BACKSPACE: "backspace",
+            glfw.KEY_UP: "up",
+            glfw.KEY_DOWN: "down",
+            glfw.KEY_LEFT: "left",
+            glfw.KEY_RIGHT: "right",
+        }
+        name = _MAP.get(keycode)
+        if name:
+            self.handle_keyboard_button(name)
 
     def handle_keyboard_button(self, key):
         if self.elastic_band:
@@ -520,6 +616,84 @@ class DefaultEnv:
         mujoco.mj_resetData(self.mj_model, self.mj_data)
 
 
+class CubeEnv(DefaultEnv):
+    """Environment with a cube object for pick and place tasks"""
+
+    def __init__(self, config: Dict[str, any], **kwargs):
+        config = config.copy()
+        config["ROBOT_SCENE"] = "decoupled_wbc/control/robot_model/model_data/g1/pnp_cube_43dof.xml"
+        super().__init__(config, "pnp_cube", **kwargs)
+
+    def update_reward(self):
+        right_hand_body = [
+            "right_hand_thumb_2_link",
+            "right_hand_middle_1_link",
+            "right_hand_index_1_link",
+        ]
+        gripper_cube_contact = check_contact(
+            self.mj_model, self.mj_data, right_hand_body, "cube_body"
+        )
+        cube_lifted = check_height(self.mj_model, self.mj_data, "cube", 0.85, 2.0)
+        with self.reward_lock:
+            self.last_reward = gripper_cube_contact & cube_lifted
+
+
+class BoxEnv(DefaultEnv):
+    """Environment with a box object for lift tasks"""
+
+    def __init__(self, config: Dict[str, any], **kwargs):
+        config = config.copy()
+        config["ROBOT_SCENE"] = "decoupled_wbc/control/robot_model/model_data/g1/lift_box_43dof.xml"
+        super().__init__(config, "lift_box", **kwargs)
+
+    def update_reward(self):
+        left_hand_body = [
+            "left_hand_thumb_2_link",
+            "left_hand_middle_1_link",
+            "left_hand_index_1_link",
+        ]
+        right_hand_body = [
+            "right_hand_thumb_2_link",
+            "right_hand_middle_1_link",
+            "right_hand_index_1_link",
+        ]
+        gripper_box_contact = check_contact(
+            self.mj_model, self.mj_data, left_hand_body, "box_body"
+        )
+        gripper_box_contact &= check_contact(
+            self.mj_model, self.mj_data, right_hand_body, "box_body"
+        )
+        box_lifted = check_height(self.mj_model, self.mj_data, "box", 0.92, 2.0)
+        with self.reward_lock:
+            self.last_reward = gripper_box_contact & box_lifted
+
+
+class BottleEnv(DefaultEnv):
+    """Environment with a bottle object for pick and place tasks"""
+
+    def __init__(self, config: Dict[str, any], **kwargs):
+        config = config.copy()
+        config["ROBOT_SCENE"] = "decoupled_wbc/control/robot_model/model_data/g1/pnp_bottle_43dof.xml"
+        camera_configs = kwargs.pop("camera_configs", {})
+        camera_configs.setdefault("egoview", {"height": 400, "width": 400})
+        super().__init__(config, "pnp_bottle", camera_configs=camera_configs, **kwargs)
+
+        self.bottle_body = self.mj_model.body("bottle_body")
+        self.bottle_geom = self.mj_model.geom("bottle")
+
+        if self.viewer is not None:
+            self.viewer.cam.type = mujoco.mjtCamera.mjCAMERA_FIXED
+            self.viewer.cam.fixedcamid = self.mj_model.camera("egoview").id
+
+    def update_reward(self):
+        pass
+
+    def get_privileged_obs(self):
+        obs_pos = self.mj_data.xpos[self.bottle_body.id]
+        obs_quat = self.mj_data.xquat[self.bottle_body.id]
+        return {"bottle_pos": obs_pos, "bottle_quat": obs_quat}
+
+
 class BaseSimulator:
     """Base simulator class that handles initialization and running of simulations"""
 
@@ -546,10 +720,16 @@ class BaseSimulator:
         # Create the environment
         if env_name == "default":
             self.sim_env = DefaultEnv(config, env_name, **kwargs)
+        elif env_name == "pnp_cube":
+            self.sim_env = CubeEnv(config, **kwargs)
+        elif env_name == "lift_box":
+            self.sim_env = BoxEnv(config, **kwargs)
+        elif env_name == "pnp_bottle":
+            self.sim_env = BottleEnv(config, **kwargs)
         else:
             raise ValueError(
                 f"Invalid environment name: {env_name}. "
-                f"Only 'default' is supported in this minimal build."
+                f"Valid options: 'default', 'pnp_cube', 'lift_box', 'pnp_bottle'."
             )
 
         try:
@@ -642,6 +822,10 @@ class BaseSimulator:
                 self.sim_env.image_publish_process.stop()
             if self.sim_env.viewer is not None:
                 self.sim_env.viewer.close()
+            if self.sim_env.head_cam_shm is not None:
+                self.sim_env.head_cam_shm.close()
+                self.sim_env.head_cam_shm.unlink()
+                self.sim_env.head_cam_shm = None
         except Exception as e:
             print(f"Warning during close: {e}")
 

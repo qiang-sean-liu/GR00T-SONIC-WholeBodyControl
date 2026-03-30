@@ -7,7 +7,7 @@ DOMAIN_ID: 0 # Domain id
 # Network Interface, "lo" for simulation and the one with "192.168.123.222" for real robot
 # INTERFACE: "enxe8ea6a9c4e09"
 # INTERFACE: "enxc8a3623c9cb7"
-INTERFACE: "lo"
+# INTERFACE: "lo"  # lo is not multicast-capable; omit to let CycloneDDS auto-select
 SIMULATOR: "mujoco"  # "robocasa"
 
 USE_JOYSTICK: 0 # Simulate Unitree WirelessController using a gamepad (0: disable, 1: enable)
@@ -17,7 +17,7 @@ JOYSTICK_DEVICE: 0 # Joystick number
 FREE_BASE: False
 
 PRINT_SCENE_INFORMATION: True # Print link, joint and sensors information of robot
-ENABLE_ELASTIC_BAND: True # Virtual spring band, used for lifting h1
+ENABLE_ELASTIC_BAND: False # Virtual spring band, used for lifting h1 (disabled for G1 — robot should fall to floor naturally)
 
 SIMULATE_DT: 0.005  # Need to be larger than the runtime of viewer.sync()
 VIEWER_DT: 0.02  # Viewer update time

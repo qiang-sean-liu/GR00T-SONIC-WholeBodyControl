@@ -45,12 +45,33 @@ def main(config: ArgsConfig):
 
     robot_model = instantiate_g1_robot_model()
 
+    # --head_cam: render stereo head cameras offscreen and write a side-by-side
+    # (left | right) frame to named shared memory for streaming to PICO via
+    # stream_cam_xr.py (XRoboToolkit Remote Vision panel).
+    # Each eye: 640×480; shared memory frame: 1280×480.
+    head_cam_kwargs = {}
+    if config.head_cam:
+        head_cam_kwargs = {
+            "camera_configs": {
+                "head_camera_left":  {"height": 480, "width": 640},
+                "head_camera_right": {"height": 480, "width": 640},
+            },
+            "head_cam_shm_name": "pico_head_cam",
+        }
+
+    # --enable_image_publish: ZMQ-based image publishing (data collection / analysis).
+    # Also needs camera_configs if not already set by --head_cam.
+    if config.enable_image_publish and not config.head_cam:
+        head_cam_kwargs["camera_configs"] = {"head_camera": {"height": 480, "width": 640}}
+
     sim_wrapper = SimWrapper(
         robot_model=robot_model,
         env_name=config.env_name,
         config=wbc_config,
         onscreen=wbc_config.get("ENABLE_ONSCREEN", True),
-        offscreen=wbc_config.get("ENABLE_OFFSCREEN", False),
+        offscreen=wbc_config.get("ENABLE_OFFSCREEN", False) or config.head_cam or config.enable_image_publish,
+        enable_image_publish=config.enable_image_publish,
+        **head_cam_kwargs,
     )
     # Start simulator as independent process
     SimulatorFactory.start_simulator(

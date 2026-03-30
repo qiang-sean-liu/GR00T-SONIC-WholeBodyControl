@@ -342,5 +342,8 @@ class SimLoopConfig(BaseConfig):
     camera_port: int = 5555
     """Camera port for image publishing"""
 
+    head_cam: bool = False
+    """Stream MuJoCo head_camera frames to PICO via vuer ImageBackground (stream_cam.py)."""
+
     verbose: bool = False
     """Verbose output, override the base config verbose"""
