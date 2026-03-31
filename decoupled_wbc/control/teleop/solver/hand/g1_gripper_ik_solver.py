@@ -67,10 +67,11 @@ class G1GripperInverseKinematicsSolver(Solver):
         q_desired[1] += amp
         q_desired[2] += amp
 
-        ampA1 = 1.5
-        ampB1 = 1.5
+        # Keep within ~80% of physical range (index_0 limit = 1.57, so target ≤ 1.25)
+        ampA1 = 1.2
+        ampB1 = 1.4
         ampA2 = 0.6
-        ampB2 = 1.5
+        ampB2 = 1.4
 
         q_desired[3] -= ampA1
         q_desired[4] -= ampB1
@@ -94,9 +95,9 @@ class G1GripperInverseKinematicsSolver(Solver):
         q_desired[2] += amp
 
         ampA1 = 1.0
-        ampB1 = 1.5
+        ampB1 = 1.4
         ampA2 = 1.0
-        ampB2 = 1.5
+        ampB2 = 1.4
 
         q_desired[3] -= ampA1
         q_desired[4] -= ampB1
@@ -120,9 +121,9 @@ class G1GripperInverseKinematicsSolver(Solver):
         q_desired[2] += amp
 
         ampA1 = 0.6
-        ampB1 = 1.5
-        ampA2 = 1.5
-        ampB2 = 1.5
+        ampB1 = 1.4
+        ampA2 = 1.2
+        ampB2 = 1.4
 
         q_desired[3] -= ampA1
         q_desired[4] -= ampB1

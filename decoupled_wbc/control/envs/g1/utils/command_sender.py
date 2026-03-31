@@ -107,7 +107,7 @@ class BodyCommandSender:
 
 def make_hand_mode(motor_index: int) -> int:
     status = 0x01
-    timeout = 0x01
+    timeout = 0x00  # 0 = normal position control; 1 is reserved for stop/relax
     mode = motor_index & 0x0F
     mode |= status << 4  # bits [4..6]
     mode |= timeout << 7  # bit 7
@@ -127,10 +127,8 @@ class HandCommandSender:
 
         self.hand_dof = 7
 
-        self.kp = [1.0] * self.hand_dof
-        self.kd = [0.2] * self.hand_dof
-        self.kp[0] = 2.0
-        self.kd[0] = 0.5
+        self.kp = [2.0] * self.hand_dof
+        self.kd = [0.5] * self.hand_dof
 
     def send_command(self, cmd: np.ndarray):
         for i in range(self.hand_dof):

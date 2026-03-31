@@ -146,14 +146,14 @@ class G1SupplementalInfo(RobotSupplementalInfo):
             "left_hand_index_1_joint": [-1.74532925, 0],
             "left_hand_middle_0_joint": [-1.57079632, 0],
             "left_hand_middle_1_joint": [-1.74532925, 0],
-            # Right hand
+            # Right hand — mirrored from left (closes in positive direction)
             "right_hand_thumb_0_joint": [-1.04719755, 1.04719755],
-            "right_hand_thumb_1_joint": [-0.72431163, 1.04719755],
-            "right_hand_thumb_2_joint": [0, 1.74532925],
-            "right_hand_index_0_joint": [-1.57079632, 0],
-            "right_hand_index_1_joint": [-1.74532925, 0],
-            "right_hand_middle_0_joint": [-1.57079632, 0],
-            "right_hand_middle_1_joint": [-1.74532925, 0],
+            "right_hand_thumb_1_joint": [-1.04719755, 0.72431163],
+            "right_hand_thumb_2_joint": [-1.74532925, 0],
+            "right_hand_index_0_joint": [0, 1.57079632],
+            "right_hand_index_1_joint": [0, 1.74532925],
+            "right_hand_middle_0_joint": [0, 1.57079632],
+            "right_hand_middle_1_joint": [0, 1.74532925],
         }
 
         # Define joint groups

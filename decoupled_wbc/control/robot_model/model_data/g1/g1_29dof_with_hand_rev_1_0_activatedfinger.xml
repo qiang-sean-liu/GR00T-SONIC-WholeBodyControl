@@ -634,14 +634,14 @@
       joint="right_hand_thumb_1_joint" />
       <motor name="right_hand_thumb_2_joint"
       joint="right_hand_thumb_2_joint" />
-      <motor name="right_hand_index_0_joint"
-      joint="right_hand_index_0_joint" />
-      <motor name="right_hand_index_1_joint"
-      joint="right_hand_index_1_joint" />
       <motor name="right_hand_middle_0_joint"
       joint="right_hand_middle_0_joint" />
       <motor name="right_hand_middle_1_joint"
-      joint="right_hand_middle_1_joint" /> --> </actuator>
+      joint="right_hand_middle_1_joint" />
+      <motor name="right_hand_index_0_joint"
+      joint="right_hand_index_0_joint" />
+      <motor name="right_hand_index_1_joint"
+      joint="right_hand_index_1_joint" /> --> </actuator>
 
   <sensor>
     <gyro name="imu-torso-angular-velocity" site="imu_in_torso" noise="5e-4" cutoff="34.9" />
