@@ -165,7 +165,12 @@ class ImagePublishProcess:
                     try:
                         from gear_sonic.utils.mujoco_sim.sensor_server import ImageUtils
 
-                        image_copies = {name: arr.copy() for name, arr in shared_arrays.items()}
+                        import cv2
+                        # MuJoCo renderer outputs RGB; convert to BGR for cv2.imencode.
+                        image_copies = {
+                            name: cv2.cvtColor(arr.copy(), cv2.COLOR_RGB2BGR)
+                            for name, arr in shared_arrays.items()
+                        }
 
                         message_dict = {
                             "images": image_copies,

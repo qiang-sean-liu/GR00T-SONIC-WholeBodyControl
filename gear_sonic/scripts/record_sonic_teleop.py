@@ -157,11 +157,13 @@ def unpack_sonic_message(raw: bytes, topic: str = "g1_debug") -> Optional[Dict[s
     }
 
 
-def unpack_image_message(raw: bytes) -> Optional[Dict[str, bytes]]:
+def unpack_image_message(raw: bytes):
     """Decode a SensorServer camera image message.
 
-    Returns a dict of camera_name -> raw JPEG bytes (still compressed,
-    ready for direct write to .jpg file without re-encoding).
+    Returns a tuple of:
+      - images: Dict[camera_name, raw JPEG bytes]
+      - timestamps: Dict[camera_name, float]  (time.time() on the sim machine)
+    or None on failure.
     """
     try:
         data = msgpack.unpackb(raw, raw=False)
@@ -169,7 +171,8 @@ def unpack_image_message(raw: bytes) -> Optional[Dict[str, bytes]]:
         for name, encoded in data.get("images", {}).items():
             if isinstance(encoded, str):
                 images[name] = base64.b64decode(encoded)
-        return images if images else None
+        timestamps: Dict[str, float] = data.get("timestamps", {})
+        return (images, timestamps) if images else None
     except Exception as e:
         print(f"[Recorder] Image decode error: {e}")
         return None
@@ -234,9 +237,9 @@ def _image_subscriber(port: int, holder: _LatestValue, stop: threading.Event, ho
     while not stop.is_set():
         try:
             raw = sock.recv()
-            images = unpack_image_message(raw)
-            if images:
-                holder.put(images)
+            result = unpack_image_message(raw)
+            if result is not None:
+                holder.put(result)  # (images_dict, timestamps_dict)
         except zmq.Again:
             pass
         except Exception as e:
@@ -254,6 +257,7 @@ class _EpisodeBuffer:
         self.pico_frames: List[Dict[str, np.ndarray]] = []
         self.sonic_frames: List[Optional[Dict[str, np.ndarray]]] = []
         self.image_frames: List[Optional[Dict[str, bytes]]] = []
+        self.image_ts_frames: List[Optional[Dict[str, float]]] = []
         self.start_wall = time.time()
 
     def append(
@@ -261,10 +265,12 @@ class _EpisodeBuffer:
         pico: Dict[str, np.ndarray],
         sonic: Optional[Dict[str, np.ndarray]],
         images: Optional[Dict[str, bytes]],
+        image_ts: Optional[Dict[str, float]],
     ) -> None:
         self.pico_frames.append(pico)
         self.sonic_frames.append(sonic)
         self.image_frames.append(images)
+        self.image_ts_frames.append(image_ts)
 
     def __len__(self) -> int:
         return len(self.pico_frames)
@@ -297,12 +303,13 @@ def save_episode(buf: _EpisodeBuffer, episode_dir: str) -> None:
     if sonic_data:
         np.savez_compressed(os.path.join(episode_dir, "sonic.npz"), **sonic_data)
 
-    # Camera images (stored as raw JPEG bytes — no re-encoding)
+    # Camera images (stored as raw JPEG bytes — no re-encoding) + per-camera timestamps
     n_image_frames = sum(1 for f in buf.image_frames if f is not None)
+    cam_timestamps: Dict[str, list] = {}
     if n_image_frames > 0:
         img_root = os.path.join(episode_dir, "images")
         frame_idx = 0
-        for frame_imgs in buf.image_frames:
+        for frame_imgs, frame_ts in zip(buf.image_frames, buf.image_ts_frames):
             if frame_imgs is None:
                 continue
             for cam_name, jpeg_bytes in frame_imgs.items():
@@ -310,7 +317,14 @@ def save_episode(buf: _EpisodeBuffer, episode_dir: str) -> None:
                 os.makedirs(cam_dir, exist_ok=True)
                 with open(os.path.join(cam_dir, f"{frame_idx:06d}.jpg"), "wb") as f:
                     f.write(jpeg_bytes)
+                if frame_ts and cam_name in frame_ts:
+                    cam_timestamps.setdefault(cam_name, []).append(frame_ts[cam_name])
             frame_idx += 1
+        if cam_timestamps:
+            np.savez_compressed(
+                os.path.join(episode_dir, "image_timestamps.npz"),
+                **{k: np.array(v) for k, v in cam_timestamps.items()},
+            )
 
     # Metadata
     duration = time.time() - buf.start_wall
@@ -320,6 +334,7 @@ def save_episode(buf: _EpisodeBuffer, episode_dir: str) -> None:
         "duration_s": round(duration, 3),
         "pico_keys": list(pico_data.keys()),
         "sonic_keys": list(sonic_data.keys()),
+        "cameras": list(cam_timestamps.keys()) if n_image_frames > 0 else [],
         "saved_at": datetime.now().isoformat(),
     }
     with open(os.path.join(episode_dir, "meta.json"), "w") as f:
@@ -465,10 +480,13 @@ def main():
 
             # Accumulate data while recording
             if recording and buf is not None:
+                img_result = image_holder.get() if not args.no_images else None
+                imgs, img_ts = (img_result if img_result is not None else (None, None))
                 buf.append(
                     pico=pose,
                     sonic=sonic_holder.get(),
-                    images=image_holder.get() if not args.no_images else None,
+                    images=imgs,
+                    image_ts=img_ts,
                 )
                 if len(buf) % 100 == 0:
                     print(f"[Recorder]   {len(buf)} frames recorded...")
