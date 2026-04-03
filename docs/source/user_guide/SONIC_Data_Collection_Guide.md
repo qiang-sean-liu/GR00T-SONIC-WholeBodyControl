@@ -300,6 +300,218 @@ The output is H.264 / yuv420p (re-encoded with ffmpeg for broad player compatibi
 
 ---
 
+## Customizing Simulation Scenes
+
+The simulator environment is selected with `--env_name` on `run_sim_loop.py`. Each environment
+name maps to a Python class that points to a MuJoCo XML scene file.
+
+### Built-in environments
+
+| `--env_name` | Task | XML scene |
+|---|---|---|
+| `default` | Empty room, robot only | `gear_sonic/data/robot_model/model_data/g1/scene_43dof.xml` |
+| `pnp_cube` | Pick and place a cube | `decoupled_wbc/control/robot_model/model_data/g1/pnp_cube_43dof.xml` |
+| `lift_box` | Bimanual box lift | `decoupled_wbc/control/robot_model/model_data/g1/lift_box_43dof.xml` |
+| `pnp_bottle` | Pick and place a bottle | `decoupled_wbc/control/robot_model/model_data/g1/pnp_bottle_43dof.xml` |
+| `kitchen_pnp_apple` | Pick apple → place on plate (kitchen) | `decoupled_wbc/control/robot_model/model_data/g1/kitchen_pnp_apple_43dof.xml` |
+
+### Running with a built-in scene
+
+Replace `--env_name` with whichever environment you want:
+
+```bash
+# Kitchen pick-and-place scene (apple → plate), with stereo head cameras
+source .venv_teleop/bin/activate
+python gear_sonic/scripts/run_sim_loop.py \
+    --env_name kitchen_pnp_apple \
+    --head_cam \
+    --enable_image_publish \
+    --enable_offscreen
+```
+
+All other terminals (WBC, PICO manager, recorder) are started exactly as described in
+[Setup](#setup-5-terminals) — only the `--env_name` argument to `run_sim_loop.py` changes.
+
+### Creating a new scene
+
+Adding a custom scene requires three steps.
+
+#### Step 1 — Write the MuJoCo XML
+
+Create a new XML file in `decoupled_wbc/control/robot_model/model_data/g1/`. Start from an
+existing scene and modify `<worldbody>` to add your objects.
+
+The mandatory first line must include the robot model:
+
+```xml
+<mujoco model="my_scene">
+  <include file="g1_29dof_with_hand_rev_1_0_activatedfinger.xml" />
+
+  <asset>
+    <material name="my_obj_mat" rgba="0.8 0.2 0.1 1" />
+  </asset>
+
+  <worldbody>
+    <light pos="0 0 2.0" dir="0 0 -1" directional="true" />
+    <geom name="floor" size="0 0 0.05" type="plane" rgba="0.8 0.8 0.8 1" />
+
+    <!-- Fixed furniture (no joint) -->
+    <body name="table_body" pos="1.2 0 0">
+      <geom name="table_top" pos="0 0 0.85" size="0.35 0.6 0.05" type="box" rgba="0.7 0.6 0.5 1" />
+      <geom name="table_base" pos="0 0 0.4"  size="0.35 0.6 0.40" type="box" rgba="0.6 0.5 0.4 1" />
+    </body>
+
+    <!-- Dynamic object (free joint so it can be picked up) -->
+    <body name="my_object_body" pos="1.1 0 0.94">
+      <joint type="free" damping="0.0008" name="my_object_joint" />
+      <geom name="my_object" type="sphere" size="0.04" material="my_obj_mat"
+        solimp="0.998 0.998 0.001" solref="0.001 2" density="120" friction="0.95 0.35 0.10" />
+    </body>
+  </worldbody>
+
+  <default>
+    <geom friction="1.0" />
+  </default>
+</mujoco>
+```
+
+**Key rules:**
+
+- `<include file="..."/>` path is relative to the XML file's own directory.
+- Do **not** redeclare cameras named `head_camera`, `head_camera_left`, or `head_camera_right` —
+  they are already defined inside the included robot XML.
+- Dynamic objects (things the robot picks up) need `<joint type="free" .../>`.
+- Fixed scene geometry (tables, walls, appliances) needs no joint.
+- All box geoms require **three** size values (half-widths in x, y, z). Cylinder geoms require
+  **two** (radius, half-height). Using the wrong number causes a MuJoCo load error.
+- Visual-only decorations (handles, labels, etc.) that should not affect physics:
+  set `contype="0" conaffinity="0"`.
+
+#### Step 2 — Add a Python environment class
+
+Open `gear_sonic/utils/mujoco_sim/base_sim.py` and add a class after `BottleEnv`:
+
+```python
+class MySceneEnv(DefaultEnv):
+    """One-line description of the task."""
+
+    def __init__(self, config: Dict[str, any], **kwargs):
+        config = config.copy()
+        config["ROBOT_SCENE"] = (
+            "decoupled_wbc/control/robot_model/model_data/g1/my_scene_43dof.xml"
+        )
+        super().__init__(config, "my_scene", **kwargs)
+
+    def update_reward(self):
+        """Return True when the task is complete (called at ~50 Hz)."""
+        success = check_contact(self.mj_model, self.mj_data, "my_object_body", "target_body")
+        with self.reward_lock:
+            self.last_reward = success
+```
+
+`check_contact(model, data, body_a, body_b)` returns `True` when any geom of `body_a` touches any
+geom of `body_b`. `check_height(model, data, geom_name, z_low, z_high)` checks whether a geom's
+centre is within a height range — useful for lifted-object conditions.
+
+#### Step 3 — Register the environment name
+
+In the same file, find the `if / elif` block inside `BaseSimulator.__init__` and add a branch:
+
+```python
+elif env_name == "my_scene":
+    self.sim_env = MySceneEnv(config, **kwargs)
+```
+
+Also extend the error message in the `else` branch so the new name appears in validation output.
+
+#### Step 4 — Launch and record
+
+```bash
+# Terminal 1 — simulator with the new scene
+source .venv_teleop/bin/activate
+python gear_sonic/scripts/run_sim_loop.py \
+    --env_name my_scene \
+    --head_cam \
+    --enable_image_publish \
+    --enable_offscreen
+
+# Terminal 5 — recorder (unchanged)
+python gear_sonic/scripts/record_sonic_teleop.py \
+    --output_dir ./recordings/my_scene
+```
+
+### Worked example — kitchen pick-and-place (apple → plate)
+
+The `kitchen_pnp_apple` environment illustrates a complete custom scene:
+
+**Scene** (`kitchen_pnp_apple_43dof.xml`):
+- Fully enclosed room: 2.6 m deep × 4.0 m wide × 2.4 m tall with tile floor, four walls, ceiling,
+  door opening (front wall), and a window with a frame (right wall).
+- L-shaped kitchen counter running along the back wall: base cabinet, marble-look worktop
+  (surface at z = 0.90 m), backsplash tile panel, wall cabinets above.
+- Appliances on the counter: microwave (right), toaster (left), stainless-steel sink with faucet (centre-left).
+- **Apple** — red sphere (r = 40 mm), free joint, placed at y = −0.20 m (left of centre on counter).
+- **Plate** — white cylinder (r = 115 mm, h = 20 mm), fixed, placed at y = +0.25 m (right of centre).
+
+**Object geometry reference:**
+
+| Object | Body name | Geom name | Type | Key size |
+|---|---|---|---|---|
+| Apple | `apple_body` | `apple` | sphere | r = 0.040 m |
+| Plate | `plate_body` | `plate` | cylinder | r = 0.115 m, h = 0.010 m |
+
+**Success condition** (`KitchenAppleToPlateEnv.update_reward`):
+
+```python
+apple_on_plate      = check_contact(model, data, "apple_body", "plate_body")
+apple_at_plate_height = check_height(model, data, "apple", 0.945, 1.05)
+reward = apple_on_plate & apple_at_plate_height
+```
+
+Apple resting on the counter sits at z ≈ 0.940 (below the 0.945 threshold), so the reward is
+`False` until the apple is lifted onto the plate (z ≈ 0.960).
+
+**Launch commands:**
+
+```bash
+# Terminal 1 — kitchen simulator
+source .venv_teleop/bin/activate
+python gear_sonic/scripts/run_sim_loop.py \
+    --env_name kitchen_pnp_apple \
+    --head_cam \
+    --enable_image_publish \
+    --enable_offscreen
+
+# Terminal 2 — WBC (unchanged)
+cd gear_sonic_deploy
+source scripts/setup_env.sh
+bash deploy.sh sim --input-type zmq_manager
+
+# Terminal 3 — PICO manager (unchanged)
+source .venv_teleop/bin/activate
+python gear_sonic/scripts/pico_manager_thread_server.py --manager \
+    --waist_tracking --vis_vr3pt
+
+# Terminal 4 — headset video stream (optional)
+source .venv_teleop/bin/activate
+python gear_sonic/scripts/stream_cam_xr.py
+
+# Terminal 5 — recorder
+source .venv_teleop/bin/activate
+python gear_sonic/scripts/record_sonic_teleop.py \
+    --output_dir ./recordings/kitchen_pnp_apple
+```
+
+To collect without camera images (faster, smaller files):
+
+```bash
+python gear_sonic/scripts/record_sonic_teleop.py \
+    --output_dir ./recordings/kitchen_pnp_apple \
+    --no_images
+```
+
+---
+
 ## Tips for Quality Data
 
 1. **Wear tight-fitting clothing** — Required for reliable foot tracker visibility (see [Teleoperation Guide](teleoperation.md#clothing-requirements))

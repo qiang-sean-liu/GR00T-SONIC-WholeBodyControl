@@ -1,0 +1,308 @@
+<mujoco model="g1_43dof_kitchen_pnp_apple scene">
+  <include file="g1_29dof_with_hand_rev_1_0_activatedfinger.xml" />
+  <!-- Note that the hand model in g1_29dof_with_hand.xml is not stable for simulation. -->
+
+  <statistic center="0.7 0 1.0" extent="3.5" />
+
+  <visual>
+    <headlight diffuse="0.7 0.7 0.65" ambient="0.4 0.4 0.4" specular="0 0 0" />
+    <rgba haze="0.08 0.08 0.08 1" />
+    <global azimuth="-130" elevation="-20" />
+  </visual>
+
+  <asset>
+    <!-- Sky: warm interior white -->
+    <texture type="skybox" builtin="flat" rgb1="0.90 0.88 0.84" rgb2="0.90 0.88 0.84" width="512" height="512" />
+    <!-- Floor: hardwood planks.
+         The texture is a gradient from a lighter to a darker oak tone across the
+         plank width (16 px).  Repeated 10× in X and 3× in Y it produces ~10
+         visible planks running toward the counter with realistic colour variation.
+         texuniform="false" lets texrepeat control the tiling independently per axis.
+    -->
+    <texture type="2d" name="wood_floor" builtin="gradient"
+      rgb1="0.68 0.50 0.30" rgb2="0.54 0.39 0.22"
+      width="16" height="256" />
+    <material name="tile_floor" texture="wood_floor" texuniform="false"
+      texrepeat="10 3" reflectance="0.07" specular="0.15" shininess="0.08" />
+    <!-- Backsplash: small subway tile look -->
+    <texture type="2d" name="backsplash_tex" builtin="checker" mark="edge"
+      rgb1="0.91 0.90 0.88" rgb2="0.86 0.85 0.83"
+      markrgb="0.70 0.70 0.68" width="200" height="100" />
+    <material name="backsplash" texture="backsplash_tex" texuniform="false" texrepeat="8 4" reflectance="0.18" />
+    <!-- Wall paint: warm off-white -->
+    <material name="wall_paint" rgba="0.93 0.91 0.87 1" reflectance="0.05" />
+    <!-- Counter top: warm cream marble -->
+    <texture type="2d" name="counter_tex" builtin="flat" rgb1="0.94 0.90 0.83" width="512" height="512" />
+    <material name="counter_top" texture="counter_tex" reflectance="0.10" />
+    <!-- Cabinet wood: warm neutral -->
+    <material name="cabinet" rgba="0.82 0.74 0.62 1" reflectance="0.05" />
+    <!-- Cabinet door face: slightly lighter -->
+    <material name="cabinet_face" rgba="0.88 0.82 0.72 1" reflectance="0.06" />
+    <!-- Appliances -->
+    <material name="microwave" rgba="0.20 0.20 0.22 1" reflectance="0.35" />
+    <material name="microwave_panel" rgba="0.30 0.30 0.32 1" reflectance="0.25" />
+    <material name="toaster" rgba="0.70 0.70 0.66 1" reflectance="0.28" />
+    <!-- Sink: brushed stainless -->
+    <material name="stainless" rgba="0.72 0.74 0.76 1" reflectance="0.40" />
+    <!-- Apple -->
+    <material name="apple_mat" rgba="0.87 0.11 0.08 1" reflectance="0.08" />
+    <!-- Plate -->
+    <material name="plate_mat" rgba="0.97 0.95 0.91 1" reflectance="0.20" />
+    <!-- Cabinet trim / edge strip -->
+    <material name="cabinet_trim" rgba="0.60 0.54 0.46 1" reflectance="0.05" />
+  </asset>
+
+  <worldbody>
+    <!-- Overhead pendant above counter -->
+    <light name="counter_light" pos="1.25 0 2.2" dir="0 0 -1" directional="false"
+      diffuse="0.75 0.73 0.68" specular="0.15 0.15 0.12" />
+    <!-- Fill from inside room (near doorway) -->
+    <light name="room_fill" pos="0.0 0 2.1" dir="0.3 0 -1" directional="true"
+      diffuse="0.35 0.35 0.35" specular="0 0 0" />
+    <!-- Daylight tint through window (right wall) -->
+    <light name="window_light" pos="0.6 1.8 1.4" dir="0 -1 0.2" directional="false"
+      diffuse="0.28 0.30 0.33" specular="0 0 0" />
+
+    <!-- === FLOOR ===
+         Bounded plane centred on the kitchen footprint.
+         Room x: [-0.6, 2.0]  y: [-2.0, 2.0]  → half-sizes 1.3 × 2.0, centre (0.7, 0).
+         The plane type gives infinite physics contact; size controls rendering only.
+    -->
+    <body name="floor_body" pos="0.7 0 0">
+      <geom name="floor" size="1.3 2.0 0.05" type="plane" material="tile_floor" />
+    </body>
+
+    <!-- === ROOM ENCLOSURE ===
+         Full kitchen room: x[-0.6, 2.0]  y[-2.0, 2.0]  z[0, 2.4]
+         Wall slab half-thickness: 0.03 m.  All corners overlap (no gaps).
+    -->
+    <body name="room">
+
+      <!-- Back wall (x = 2.0, inner face visible to robot) -->
+      <geom name="wall_back"  pos="2.03  0     1.20" size="0.03 2.03 1.20" type="box" material="wall_paint" />
+
+      <!-- Left wall  (y = -2.0) -->
+      <geom name="wall_left"  pos="0.70 -2.03  1.20" size="1.33 0.03 1.20" type="box" material="wall_paint" />
+
+      <!-- Right wall (y = +2.0) — contains a window panel -->
+      <geom name="wall_right" pos="0.70  2.03  1.20" size="1.33 0.03 1.20" type="box" material="wall_paint" />
+
+      <!-- Front wall (x = -0.6) — split around a centred 0.9 m-wide × 2.1 m-tall doorway -->
+      <!--   Door opening: y ∈ [-0.45, 0.45],  z ∈ [0, 2.1]                                -->
+      <geom name="wall_front_l"      pos="-0.63 -1.225 1.20" size="0.03 0.775 1.20" type="box" material="wall_paint" />
+      <geom name="wall_front_r"      pos="-0.63  1.225 1.20" size="0.03 0.775 1.20" type="box" material="wall_paint" />
+      <geom name="wall_front_lintel" pos="-0.63  0     2.25" size="0.03 0.45  0.15" type="box" material="wall_paint" />
+
+      <!-- Ceiling -->
+      <geom name="ceiling_slab" pos="0.70 0 2.43" size="1.33 2.03 0.03" type="box" rgba="0.96 0.94 0.91 1" />
+
+      <!-- ── Door frame (painted-wood trim) ── -->
+      <geom name="door_jamb_l"  pos="-0.60 -0.45 1.05" size="0.020 0.020 1.05" type="box"
+        rgba="0.90 0.87 0.82 1" contype="0" conaffinity="0" />
+      <geom name="door_jamb_r"  pos="-0.60  0.45 1.05" size="0.020 0.020 1.05" type="box"
+        rgba="0.90 0.87 0.82 1" contype="0" conaffinity="0" />
+      <geom name="door_head"    pos="-0.60  0    2.12" size="0.020 0.47  0.020" type="box"
+        rgba="0.90 0.87 0.82 1" contype="0" conaffinity="0" />
+
+      <!-- ── Window on right wall (0.9 m wide × 1.0 m tall, centred at x=0.6, z=1.4) ── -->
+      <!-- Frosted-glass pane (light blue, semi-transparent) -->
+      <geom name="window_glass"    pos="0.60 2.01  1.40" size="0.45 0.010 0.50"
+        type="box" rgba="0.72 0.84 0.90 0.45" contype="0" conaffinity="0" />
+      <!-- Outer frame -->
+      <geom name="win_frame_top"   pos="0.60 2.015 1.905" size="0.47 0.015 0.025" type="box"
+        rgba="0.88 0.86 0.82 1" contype="0" conaffinity="0" />
+      <geom name="win_frame_bot"   pos="0.60 2.015 0.895" size="0.47 0.015 0.025" type="box"
+        rgba="0.88 0.86 0.82 1" contype="0" conaffinity="0" />
+      <geom name="win_frame_left"  pos="0.14 2.015 1.40" size="0.020 0.015 0.52" type="box"
+        rgba="0.88 0.86 0.82 1" contype="0" conaffinity="0" />
+      <geom name="win_frame_right" pos="1.06 2.015 1.40" size="0.020 0.015 0.52" type="box"
+        rgba="0.88 0.86 0.82 1" contype="0" conaffinity="0" />
+      <!-- Cross-bars (muntins) -->
+      <geom name="win_bar_h" pos="0.60 2.012 1.40" size="0.45  0.012 0.012" type="box"
+        rgba="0.88 0.86 0.82 1" contype="0" conaffinity="0" />
+      <geom name="win_bar_v" pos="0.60 2.012 1.40" size="0.012 0.012 0.50"  type="box"
+        rgba="0.88 0.86 0.82 1" contype="0" conaffinity="0" />
+
+    </body>
+
+    <!-- === KITCHEN COUNTER === -->
+    <!--
+      Counter body at x=1.25, y=0, z=0 (world origin of this body).
+      counter_base : 0.35 x 1.2 x 0.4  → world z: 0 to 0.80
+      counter_top  : 0.35 x 1.2 x 0.05 → world z: 0.80 to 0.90   (surface at z=0.90)
+    -->
+    <body name="counter_body" pos="1.25 0 0">
+      <!-- Lower cabinet body -->
+      <geom name="counter_base" pos="0 0 0.40" size="0.35 1.20 0.40" type="box" material="cabinet" />
+      <!-- Counter top surface (marble / composite) -->
+      <geom name="counter_top_geom" pos="0 0 0.85" size="0.35 1.20 0.05" type="box" material="counter_top" />
+      <!-- Toe kick recess (front strip at base) -->
+      <geom name="toe_kick" pos="-0.30 0 0.06" size="0.05 1.20 0.06" type="box" rgba="0.45 0.40 0.35 1" />
+
+      <!-- Cabinet door faces (front panel, visual only) -->
+      <!-- Left cabinet door -->
+      <geom name="door_face_l" pos="-0.352 -0.55 0.42" size="0.005 0.60 0.36" type="box" material="cabinet_face"
+        contype="0" conaffinity="0" />
+      <!-- Right cabinet door -->
+      <geom name="door_face_r" pos="-0.352 0.55 0.42" size="0.005 0.60 0.36" type="box" material="cabinet_face"
+        contype="0" conaffinity="0" />
+      <!-- Center divider strip -->
+      <geom name="door_divider" pos="-0.352 0 0.42" size="0.005 0.03 0.36" type="box" material="cabinet_trim"
+        contype="0" conaffinity="0" />
+      <!-- Door handles (small cylinders) -->
+      <geom name="handle_l" pos="-0.36 -0.12 0.42" size="0.008 0.06" type="cylinder"
+        rgba="0.60 0.58 0.55 1" contype="0" conaffinity="0" />
+      <geom name="handle_r" pos="-0.36 0.12 0.42" size="0.008 0.06" type="cylinder"
+        rgba="0.60 0.58 0.55 1" contype="0" conaffinity="0" />
+    </body>
+
+    <!-- === BACKSPLASH TILE PANEL === -->
+    <!-- Sits between counter top (z=0.90) and wall cabinet bottom (z=1.20) -->
+    <body name="backsplash_body">
+      <geom name="backsplash_geom" pos="1.62 0 1.05" size="0.02 1.20 0.15" type="box" material="backsplash" />
+    </body>
+
+    <!-- === WALL CABINETS ABOVE COUNTER === -->
+    <!--
+      wall_cabinet : center z=1.50, half-size z=0.30 → z: 1.20 to 1.80
+    -->
+    <body name="wall_cabinet_body">
+      <geom name="wall_cabinet" pos="1.55 0 1.50" size="0.22 0.90 0.30" type="box" material="cabinet" />
+      <!-- Wall cabinet door faces -->
+      <geom name="wc_door_l" pos="1.33 -0.40 1.50" size="0.005 0.46 0.28" type="box" material="cabinet_face"
+        contype="0" conaffinity="0" />
+      <geom name="wc_door_r" pos="1.33 0.40 1.50" size="0.005 0.46 0.28" type="box" material="cabinet_face"
+        contype="0" conaffinity="0" />
+      <geom name="wc_divider" pos="1.33 0 1.50" size="0.005 0.03 0.28" type="box" material="cabinet_trim"
+        contype="0" conaffinity="0" />
+      <!-- Cabinet door handles -->
+      <geom name="wc_handle_l" pos="1.32 -0.08 1.50" size="0.006 0.05" type="cylinder"
+        rgba="0.60 0.58 0.55 1" contype="0" conaffinity="0" />
+      <geom name="wc_handle_r" pos="1.32 0.08 1.50" size="0.006 0.05" type="cylinder"
+        rgba="0.60 0.58 0.55 1" contype="0" conaffinity="0" />
+      <!-- Bottom trim strip of wall cabinet -->
+      <geom name="wc_bottom_trim" pos="1.33 0 1.205" size="0.005 0.90 0.01" type="box" material="cabinet_trim"
+        contype="0" conaffinity="0" />
+    </body>
+
+    <!-- === MICROWAVE (right side of counter, y ~ 0.80) === -->
+    <!--
+      Sits on counter top (z=0.90). Geom half-height 0.09 → center z=0.99, top z=1.08.
+    -->
+    <body name="microwave_body">
+      <geom name="microwave_box" pos="1.20 0.88 0.99" size="0.22 0.19 0.09" type="box" material="microwave" />
+      <!-- Dark display panel on front face -->
+      <geom name="microwave_panel" pos="0.98 0.88 0.99" size="0.005 0.12 0.07" type="box" material="microwave_panel"
+        contype="0" conaffinity="0" />
+      <!-- Door handle -->
+      <geom name="microwave_handle" pos="0.98 0.70 0.99" size="0.006 0.04" type="cylinder"
+        rgba="0.55 0.55 0.55 1" contype="0" conaffinity="0" />
+    </body>
+
+    <!-- === TOASTER (left side of counter, y ~ -0.80) === -->
+    <!--
+      Sits on counter top (z=0.90). Geom half-height 0.04 → center z=0.94, top z=0.98.
+    -->
+    <body name="toaster_body">
+      <geom name="toaster_box" pos="1.12 -0.85 0.94" size="0.12 0.15 0.04" type="box" material="toaster" />
+      <!-- Toast slots (dark visual-only) -->
+      <geom name="slot1" pos="1.12 -0.85 0.985" size="0.04 0.03 0.005" type="box"
+        rgba="0.12 0.12 0.12 1" contype="0" conaffinity="0" />
+      <geom name="slot2" pos="1.12 -0.76 0.985" size="0.04 0.03 0.005" type="box"
+        rgba="0.12 0.12 0.12 1" contype="0" conaffinity="0" />
+      <!-- Lever on side -->
+      <geom name="toaster_lever" pos="1.00 -0.85 0.96" size="0.005 0.04" type="cylinder"
+        rgba="0.55 0.55 0.52 1" contype="0" conaffinity="0" />
+    </body>
+
+    <!-- === SINK (center-left of counter, y ~ -0.40) === -->
+    <!--
+      Represented as a stainless steel basin inset into the counter.
+      The counter_top geom is a solid box, so the sink is above it — visually the
+      basin appears to cut in via its own geometry.
+    -->
+    <body name="sink_body">
+      <!-- Sink basin outer rim (sits flush on counter top) -->
+      <geom name="sink_rim" pos="1.25 -0.42 0.905" size="0.20 0.18 0.005" type="box" material="stainless" />
+      <!-- Basin floor below rim -->
+      <geom name="sink_basin_floor" pos="1.25 -0.42 0.875" size="0.16 0.14 0.005" type="box" material="stainless"
+        contype="0" conaffinity="0" />
+      <!-- Basin walls (visual only) -->
+      <geom name="sink_wall_front" pos="1.06 -0.42 0.890" size="0.005 0.14 0.020" type="box" material="stainless"
+        contype="0" conaffinity="0" />
+      <geom name="sink_wall_back"  pos="1.44 -0.42 0.890" size="0.005 0.14 0.020" type="box" material="stainless"
+        contype="0" conaffinity="0" />
+      <geom name="sink_wall_left"  pos="1.25 -0.56 0.890" size="0.16 0.005 0.020" type="box" material="stainless"
+        contype="0" conaffinity="0" />
+      <geom name="sink_wall_right" pos="1.25 -0.28 0.890" size="0.16 0.005 0.020" type="box" material="stainless"
+        contype="0" conaffinity="0" />
+      <!-- Drain dot -->
+      <geom name="drain" pos="1.25 -0.42 0.882" size="0.025 0.002" type="cylinder"
+        rgba="0.40 0.42 0.44 1" contype="0" conaffinity="0" />
+      <!-- Faucet (standing on back of sink rim) -->
+      <geom name="faucet_base_cyl" pos="1.43 -0.42 0.915" size="0.018 0.006" type="cylinder" material="stainless" />
+      <geom name="faucet_neck"     pos="1.43 -0.42 0.960" size="0.010 0.010 0.040" type="box"  material="stainless"
+        contype="0" conaffinity="0" />
+      <geom name="faucet_spout"    pos="1.22 -0.42 0.998" size="0.055 0.010 0.010" type="box" material="stainless"
+        contype="0" conaffinity="0" />
+      <geom name="faucet_tip"      pos="1.165 -0.42 0.990" size="0.010 0.010" type="cylinder" material="stainless"
+        contype="0" conaffinity="0" />
+    </body>
+
+    <!-- === OVERHEAD LIGHT FIXTURE === -->
+    <body name="light_fixture">
+      <geom name="light_bar" pos="1.25 0 2.06" size="0.04 0.55 0.018" type="box" rgba="0.97 0.97 0.93 1"
+        contype="0" conaffinity="0" />
+    </body>
+
+    <!-- === APPLE (dynamic - pick-and-place object) === -->
+    <!--
+      Rests on counter top (z=0.90). Sphere radius=0.040 → center z=0.940.
+      Placed on the LEFT side of counter (y=-0.20), away from plate.
+    -->
+    <body name="apple_body" pos="1.10 -0.20 0.940">
+      <joint type="free" damping="0.0008" name="apple_joint" />
+      <geom name="apple" type="sphere" size="0.040" material="apple_mat"
+        solimp="0.998 0.998 0.001" solref="0.001 2" density="120" friction="0.95 0.35 0.10" />
+      <!-- Stem (visual only) -->
+      <geom name="apple_stem" pos="0 0 0.038" type="cylinder" size="0.005 0.010"
+        rgba="0.30 0.18 0.06 1" contype="0" conaffinity="0" />
+      <!-- Leaf hint -->
+      <geom name="apple_leaf" pos="0.012 0 0.046" type="box" size="0.010 0.005 0.003"
+        rgba="0.25 0.55 0.15 1" contype="0" conaffinity="0" />
+    </body>
+
+    <!-- === PLATE (static target zone) === -->
+    <!--
+      Rests on counter top (z=0.90). Cylinder half-height=0.010 → center z=0.910, top surface z=0.920.
+      Placed on the RIGHT side of counter (y=+0.25), awaiting the apple.
+      Apple placed on plate: apple center z = 0.920 + 0.040 = 0.960.
+    -->
+    <body name="plate_body" pos="1.10 0.25 0.910">
+      <!-- Plate body: flat white cylinder -->
+      <geom name="plate" type="cylinder" size="0.115 0.010" material="plate_mat"
+        solimp="0.998 0.998 0.001" solref="0.001 2" density="600" friction="0.50 0.20 0.05" />
+      <!-- Raised rim (visual only) -->
+      <geom name="plate_rim_outer" pos="0 0 0.012" type="cylinder" size="0.115 0.004"
+        rgba="0.80 0.78 0.74 1" contype="0" conaffinity="0" />
+      <geom name="plate_rim_inner" pos="0 0 0.013" type="cylinder" size="0.095 0.003"
+        rgba="0.97 0.95 0.91 1" contype="0" conaffinity="0" />
+    </body>
+
+    <!-- === GOAL SITE (invisible debug marker where apple should land) === -->
+    <site name="apple_goal" pos="1.10 0.25 0.960" size="0.042" rgba="0 0.8 0.2 0.12" type="sphere" />
+
+    <!-- Head cameras (head_camera, head_camera_left, head_camera_right) are defined
+         in the included robot XML (g1_29dof_with_hand_rev_1_0_activatedfinger.xml). -->
+    <!-- Third-person overview for debugging -->
+    <camera name="overview"
+      pos="-0.80 -1.40 1.80"
+      xyaxes="0.766 -0.643 0.000 0.376 0.448 0.812"
+      fovy="60" />
+
+  </worldbody>
+
+  <default>
+    <geom friction="1.0" />
+  </default>
+</mujoco>

@@ -694,6 +694,40 @@ class BottleEnv(DefaultEnv):
         return {"bottle_pos": obs_pos, "bottle_quat": obs_quat}
 
 
+class KitchenAppleToPlateEnv(DefaultEnv):
+    """Kitchen scene: pick up an apple from the counter and place it on a plate.
+
+    Counter top surface: z = 0.90 m.
+    Apple initial position: x=1.10, y=-0.20, z=0.940 (left of centre).
+    Plate position (fixed):  x=1.10, y=+0.25, z=0.910 (right of centre).
+    Success: apple is resting on the plate
+             (contact between apple_body and plate_body, apple centre z ≈ 0.960).
+    """
+
+    def __init__(self, config: Dict[str, any], **kwargs):
+        config = config.copy()
+        config["ROBOT_SCENE"] = (
+            "decoupled_wbc/control/robot_model/model_data/g1/kitchen_pnp_apple_43dof.xml"
+        )
+        super().__init__(config, "kitchen_pnp_apple", **kwargs)
+
+    def update_reward(self):
+        # Apple must be in contact with the plate AND sitting at plate height (not just
+        # resting on the counter at z=0.94 or held high in the air).
+        # Apple on plate → centre z ≈ 0.960; counter-only → centre z ≈ 0.940.
+        apple_on_plate = check_contact(self.mj_model, self.mj_data, "apple_body", "plate_body")
+        apple_at_plate_height = check_height(self.mj_model, self.mj_data, "apple", 0.945, 1.05)
+        with self.reward_lock:
+            self.last_reward = apple_on_plate & apple_at_plate_height
+
+    def get_privileged_obs(self):
+        apple_body = self.mj_model.body("apple_body")
+        return {
+            "apple_pos": self.mj_data.xpos[apple_body.id].copy(),
+            "apple_quat": self.mj_data.xquat[apple_body.id].copy(),
+        }
+
+
 class BaseSimulator:
     """Base simulator class that handles initialization and running of simulations"""
 
@@ -726,10 +760,13 @@ class BaseSimulator:
             self.sim_env = BoxEnv(config, **kwargs)
         elif env_name == "pnp_bottle":
             self.sim_env = BottleEnv(config, **kwargs)
+        elif env_name == "kitchen_pnp_apple":
+            self.sim_env = KitchenAppleToPlateEnv(config, **kwargs)
         else:
             raise ValueError(
                 f"Invalid environment name: {env_name}. "
-                f"Valid options: 'default', 'pnp_cube', 'lift_box', 'pnp_bottle'."
+                f"Valid options: 'default', 'pnp_cube', 'lift_box', 'pnp_bottle', "
+                f"'kitchen_pnp_apple'."
             )
 
         try:
