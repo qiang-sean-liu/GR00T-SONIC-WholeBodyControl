@@ -11,7 +11,7 @@ from typing import Sequence
 
 import numpy as np
 
-HEADER_SIZE = 1280
+HEADER_SIZE = 2048
 
 
 def _build_header(fields: list, version: int = 1, count: int = 1) -> bytes:

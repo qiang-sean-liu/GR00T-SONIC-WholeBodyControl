@@ -1,9 +1,10 @@
 """Record SONIC+PICO teleop episodes from the gear_sonic pipeline.
 
-Subscribes to three ZMQ streams:
+Subscribes to four ZMQ streams:
   - Port 5556 (topic 'pose'): PICO human motion, VR data, toggle signals
   - Port 5557 (topic 'g1_debug'): SONIC WBC outputs (target/measured joint positions)
   - Port 5555: sim camera images (requires --enable_image_publish in run_sim_loop.py)
+  - Port 5558 (topic 'base_state'): ground-truth base position/velocity from MuJoCo
 
 Recording is controlled by the PICO controller:
   Left grip + A = start / stop episode
@@ -38,6 +39,11 @@ pico.npz keys  (see pico_manager_thread_server.py):
   timestamp_realtime  [T, 1]      wall-clock timestamp (s)
   timestamp_monotonic [T, 1]      monotonic timestamp (s)
   heading_increment   [T, 1]      yaw accumulator change (rad)
+  navigate_cmd              [T, 3]   [vx, vy, ω_z] velocity command (m/s, m/s, rad/s) — active source
+  navigate_cmd_joystick     [T, 3]   joystick-derived navigate_cmd (always recorded)
+  navigate_cmd_pelvis       [T, 3]   foot-tracker-derived navigate_cmd (NaN when trackers unavailable)
+  base_height_cmd_joystick  [T, 1]   button-driven pelvis height (m), 0.20–0.74; X=lower, Y=raise
+  base_height_cmd_pelvis    [T, 1]   SMPL pelvis Z in robot frame (absolute world metres); NaN when unavailable
 
 sonic.npz keys  (see output_interface.hpp):
   body_q_target       [T, 29]  SONIC target joint positions (MuJoCo order) ← WBC action
@@ -49,6 +55,10 @@ sonic.npz keys  (see output_interface.hpp):
   vr_3point_position  [T, 9]   VR positions rotated into target body frame
   vr_3point_orientation [T, 12] VR orientations (passed through)
   vr_3point_compliance  [T, 3]  VR compliance values
+  base_pos_sim        [T, 3]   ground-truth base XYZ from MuJoCo (world frame)
+  base_quat_sim       [T, 4]   ground-truth base quaternion wxyz from MuJoCo
+  base_linvel_sim     [T, 3]   ground-truth base linear velocity (world frame)
+  base_angvel_sim     [T, 3]   ground-truth base angular velocity (world frame)
 
 Usage::
 
@@ -61,7 +71,10 @@ Usage::
     # Custom ports / output directory:
     python gear_sonic/scripts/record_sonic_teleop.py \\
         --output_dir /data/recordings \\
-        --pose_port 5556 --sonic_port 5557 --image_port 5555
+        --pose_port 5556 --sonic_port 5557 --image_port 5555 --base_state_port 5558
+
+    # Without base state (e.g. real robot, no MuJoCo sim):
+    python gear_sonic/scripts/record_sonic_teleop.py --base_state_port 0
 """
 
 import argparse
@@ -78,7 +91,7 @@ import numpy as np
 import zmq
 
 # Must match HEADER_SIZE in zmq_planner_sender.py
-_HEADER_SIZE = 1280
+_HEADER_SIZE = 2048
 
 _DTYPE_MAP = {
     "f32": np.float32,
@@ -147,6 +160,29 @@ def unpack_sonic_message(raw: bytes, topic: str = "g1_debug") -> Optional[Dict[s
     if not raw.startswith(topic_bytes):
         return None
     payload = raw[len(topic_bytes) :]
+    try:
+        data = msgpack.unpackb(payload)
+    except Exception:
+        return None
+    return {
+        (k.decode() if isinstance(k, bytes) else k): np.array(v, dtype=np.float64)
+        for k, v in data.items()
+    }
+
+
+def unpack_base_state_message(raw: bytes, topic: str = "base_state") -> Optional[Dict[str, np.ndarray]]:
+    """Decode a msgpack base_state message published by DefaultEnv.
+
+    Wire layout::
+
+        [topic_bytes][msgpack payload]
+
+    The msgpack payload maps field names to lists of float64.
+    """
+    topic_bytes = topic.encode("utf-8")
+    if not raw.startswith(topic_bytes):
+        return None
+    payload = raw[len(topic_bytes):]
     try:
         data = msgpack.unpackb(payload)
     except Exception:
@@ -244,6 +280,29 @@ def _image_subscriber(port: int, holder: _LatestValue, stop: threading.Event, ho
             pass
         except Exception as e:
             print(f"[Recorder] Image recv error: {e}")
+    sock.close()
+    ctx.term()
+
+
+def _base_state_subscriber(port: int, topic: str, holder: _LatestValue, stop: threading.Event, host: str):
+    ctx = zmq.Context()
+    sock = ctx.socket(zmq.SUB)
+    sock.setsockopt(zmq.RCVHWM, 10)
+    sock.setsockopt(zmq.LINGER, 0)
+    sock.setsockopt_string(zmq.SUBSCRIBE, topic)
+    sock.setsockopt(zmq.RCVTIMEO, 200)
+    sock.connect(f"tcp://{host}:{port}")
+    print(f"[Recorder] Base-state subscriber: tcp://{host}:{port} topic='{topic}'")
+    while not stop.is_set():
+        try:
+            raw = sock.recv()
+            parsed = unpack_base_state_message(raw, topic)
+            if parsed is not None:
+                holder.put(parsed)
+        except zmq.Again:
+            pass
+        except Exception as e:
+            print(f"[Recorder] Base-state recv error: {e}")
     sock.close()
     ctx.term()
 
@@ -377,6 +436,10 @@ def main():
         help="Host for ZMQ connections (default: localhost)",
     )
     parser.add_argument(
+        "--base_state_port", type=int, default=5558,
+        help="ZMQ port for ground-truth base state (default: 5558, 0 = disabled)",
+    )
+    parser.add_argument(
         "--no_images", action="store_true",
         help="Skip camera image recording (faster, smaller output)",
     )
@@ -387,6 +450,7 @@ def main():
     stop_event = threading.Event()
     sonic_holder = _LatestValue()
     image_holder = _LatestValue()
+    base_state_holder = _LatestValue()
 
     # Start background subscribers
     threading.Thread(
@@ -395,6 +459,14 @@ def main():
         daemon=True,
         name="sonic-sub",
     ).start()
+
+    if args.base_state_port > 0:
+        threading.Thread(
+            target=_base_state_subscriber,
+            args=(args.base_state_port, "base_state", base_state_holder, stop_event, args.host),
+            daemon=True,
+            name="base-state-sub",
+        ).start()
 
     if not args.no_images:
         threading.Thread(
@@ -444,9 +516,11 @@ def main():
             if now - last_heartbeat >= 5.0:
                 status = f"RECORDING ({len(buf)} frames)" if recording else "idle"
                 sonic_ok = sonic_holder.get() is not None
+                base_ok = base_state_holder.get() is not None if args.base_state_port > 0 else None
+                base_str = f"  base_state={'ok' if base_ok else 'no data'}" if base_ok is not None else ""
                 print(
                     f"[Recorder] pose msgs={pose_msg_count}  status={status}"
-                    f"  sonic={'ok' if sonic_ok else 'no data'}"
+                    f"  sonic={'ok' if sonic_ok else 'no data'}{base_str}"
                 )
                 last_heartbeat = now
 
@@ -482,9 +556,18 @@ def main():
             if recording and buf is not None:
                 img_result = image_holder.get() if not args.no_images else None
                 imgs, img_ts = (img_result if img_result is not None else (None, None))
+
+                # Merge ground-truth base state into sonic dict (if available)
+                sonic_frame = sonic_holder.get()
+                base_state = base_state_holder.get() if args.base_state_port > 0 else None
+                if sonic_frame is not None and base_state is not None:
+                    sonic_frame = {**sonic_frame, **base_state}
+                elif base_state is not None:
+                    sonic_frame = base_state
+
                 buf.append(
                     pico=pose,
-                    sonic=sonic_holder.get(),
+                    sonic=sonic_frame,
                     images=imgs,
                     image_ts=img_ts,
                 )

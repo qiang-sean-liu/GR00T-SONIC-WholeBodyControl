@@ -6,11 +6,11 @@
  *
  * Each ZMQ message is a **single-part message** with the following layout:
  *
- *   [topic_prefix (optional)] [1280-byte JSON header] [concatenated binary fields]
+ *   [topic_prefix (optional)] [2048-byte JSON header] [concatenated binary fields]
  *
  * - **Topic prefix**: If a non-empty topic is configured, the subscriber
  *   filters on this prefix and strips it before processing.
- * - **JSON header** (exactly `HEADER_SIZE` = 1280 bytes, null-padded):
+ * - **JSON header** (exactly `HEADER_SIZE` = 2048 bytes, null-padded):
  *   Describes the binary payload – version, endianness, field names, dtypes,
  *   and shapes.  Example:
  *   ```json
@@ -96,7 +96,7 @@ inline T byte_swap(T value) {
 class ZMQPackedMessageSubscriber {
   public:
     /// Fixed size (in bytes) of the JSON header block at the start of each packed message.
-    static constexpr size_t HEADER_SIZE = 1280;
+    static constexpr size_t HEADER_SIZE = 2048;
 
     /**
      * @brief Construct a subscriber (does NOT connect or start yet).

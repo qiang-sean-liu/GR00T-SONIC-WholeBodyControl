@@ -71,6 +71,7 @@ def main(config: ArgsConfig):
         onscreen=wbc_config.get("ENABLE_ONSCREEN", True),
         offscreen=wbc_config.get("ENABLE_OFFSCREEN", False) or config.head_cam or config.enable_image_publish,
         enable_image_publish=config.enable_image_publish,
+        base_state_port=config.base_state_port,
         **head_cam_kwargs,
     )
     # Start simulator as independent process

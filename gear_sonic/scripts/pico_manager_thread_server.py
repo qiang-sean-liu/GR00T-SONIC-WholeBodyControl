@@ -515,6 +515,116 @@ def generate_finger_data(hand: str, trigger: float, grip: float) -> np.ndarray:
 # Joystick deadzone threshold
 JOYSTICK_DEADZONE = 0.15
 
+# navigate_cmd / base_height constants (match decoupled_wbc pico_streamer.py)
+_NAV_DEAD_ZONE = 0.1
+_NAV_MAX_LIN_VEL = 0.5   # m/s
+_NAV_MAX_ANG_VEL = 1.0   # rad/s
+_BASE_HEIGHT_INIT = 0.74
+_BASE_HEIGHT_STEP = 0.01
+_BASE_HEIGHT_MIN = 0.20
+_BASE_HEIGHT_MAX = 0.74
+
+
+def _nav_dead_zone(v: float, dz: float = _NAV_DEAD_ZONE) -> float:
+    """Dead-zone + re-normalize to [-1, 1], matching pico_streamer._apply_dead_zone."""
+    if abs(v) < dz:
+        return 0.0
+    sign = 1.0 if v > 0 else -1.0
+    return sign * (abs(v) - dz) / (1.0 - dz)
+
+
+# Unity → Robot coordinate transform (same Q used in _compute_rel_transform)
+_Q_UNITY_TO_ROBOT = np.array([[-1.0, 0.0, 0.0], [0.0, 0.0, 1.0], [0.0, 1.0, 0.0]])
+
+# Maximum believable pelvis speed (m/s) — discard frames with larger jumps
+_PELVIS_MAX_SPEED = 3.0
+
+_PELVIS_NAV_UNAVAILABLE = np.full(3, np.nan, dtype=np.float32)
+_PELVIS_HEIGHT_UNAVAILABLE = np.full(1, np.nan, dtype=np.float32)
+
+
+def _pelvis_robot_state(body_poses_np: np.ndarray):
+    """Return (pelvis_pos_robot [3], pelvis_yaw_robot) from SMPL raw data.
+
+    body_poses_np: shape (24, 7) — each row [x, y, z, qx, qy, qz, qw] in Unity frame
+    pelvis is joint index 0.
+    Returns (pos_robot, yaw) where pos_robot is in robot frame [fwd, left, up].
+    """
+    pelvis = body_poses_np[0]
+    pos_robot = _Q_UNITY_TO_ROBOT @ pelvis[:3]
+
+    # Rotate pelvis quaternion to robot frame and extract yaw (about Z_robot)
+    # Input quat is scalar-last: [qx, qy, qz, qw]
+    R_unity = sRot.from_quat(pelvis[3:7])
+    R_robot = sRot.from_matrix(_Q_UNITY_TO_ROBOT @ R_unity.as_matrix() @ _Q_UNITY_TO_ROBOT.T)
+    # Apply same yaw offset as OFFSETS[0] (root: -90° about fixed Z)
+    R_robot = R_robot * OFFSETS[0]
+    yaw = R_robot.as_euler("ZYX")[0]
+    return pos_robot, yaw
+
+
+def _pelvis_navigate_cmd(
+    body_poses_np: np.ndarray,
+    prev_pos: np.ndarray | None,
+    prev_yaw: float,
+    dt: float,
+):
+    """Derive navigate_cmd [vx, vy, ω] from pelvis (SMPL joint 0) motion.
+
+    Requires foot trackers for accurate lower-body pose.  Velocity is computed
+    in world-robot frame then rotated to the body heading frame, matching the
+    convention of decoupled_wbc pico_streamer.py.
+
+    Returns:
+        (navigate_cmd_pelvis [3] float32, available bool)
+        When unavailable, returns (_PELVIS_NAV_UNAVAILABLE, False) — caller
+        should store NaN to signal missing data in the recording.
+    """
+    if body_poses_np is None or body_poses_np.shape != (24, 7):
+        return _PELVIS_NAV_UNAVAILABLE, False
+
+    curr_pos, curr_yaw = _pelvis_robot_state(body_poses_np)
+
+    if prev_pos is None or dt <= 0.0 or dt > 0.5:
+        return _PELVIS_NAV_UNAVAILABLE, False
+
+    vel_world = (curr_pos - prev_pos) / dt  # [fwd, left, up] in world-robot frame
+
+    # Sanity check: discard frames with physically impossible speed
+    speed = float(np.linalg.norm(vel_world[:2]))
+    if speed > _PELVIS_MAX_SPEED:
+        return _PELVIS_NAV_UNAVAILABLE, False
+
+    # Rotate to body heading frame: v_body = R(-yaw) @ v_world_xy
+    cy, sy = np.cos(-curr_yaw), np.sin(-curr_yaw)
+    vx = cy * vel_world[0] - sy * vel_world[1]
+    vy = sy * vel_world[0] + cy * vel_world[1]
+
+    # Yaw rate: wrap Δyaw to [-π, π] and divide by dt
+    dyaw = curr_yaw - prev_yaw
+    dyaw = (dyaw + np.pi) % (2.0 * np.pi) - np.pi
+    omega = dyaw / dt
+
+    return np.array([vx, vy, omega], dtype=np.float32), True
+
+
+def _pelvis_height_cmd(body_poses_np: np.ndarray):
+    """Extract pelvis height (Z in robot frame = up direction) from SMPL joint 0.
+
+    body_poses_np: shape (24, 7) — each row [x, y, z, qx, qy, qz, qw] in Unity frame.
+    In the Unity→Robot transform, Unity-Y maps to Robot-Z (up), so pelvis height is
+    pos_robot[2] = body_poses_np[0, 1].  This is the operator's absolute pelvis height
+    above the Unity world origin in metres.
+
+    Returns:
+        (base_height_cmd_pelvis [1] float32, available bool)
+        When unavailable, returns (_PELVIS_HEIGHT_UNAVAILABLE, False).
+    """
+    if body_poses_np is None or body_poses_np.shape != (24, 7):
+        return _PELVIS_HEIGHT_UNAVAILABLE.copy(), False
+    pos_robot, _ = _pelvis_robot_state(body_poses_np)
+    return np.array([pos_robot[2]], dtype=np.float32), True
+
 
 class YawAccumulator:
     """Accumulates yaw heading angle based on joystick input."""
@@ -820,6 +930,7 @@ def _pose_stream_common(
     with_g1_robot: bool = True,
     enable_waist_tracking: bool = False,
     enable_smpl_vis: bool = False,
+    navigate_cmd_source: str = "pelvis",
 ):
     """Shared pose streaming loop used by run_pico."""
     if xrt is None:
@@ -850,6 +961,7 @@ def _pose_stream_common(
         record_dir=record_dir,
         record_format=record_format,
         log_prefix=log_prefix,
+        navigate_cmd_source=navigate_cmd_source,
     )
 
     if stop_event is None:
@@ -1176,6 +1288,7 @@ class PoseStreamer:
         record_dir: str,
         record_format: str,
         log_prefix: str = "PoseLoop",
+        navigate_cmd_source: str = "pelvis",
     ):
         self.socket = socket
         self.reader = reader
@@ -1248,6 +1361,12 @@ class PoseStreamer:
             True  # Start with buffer cleared - wait for full buffer before first send
         )
         self.yaw_accumulator = YawAccumulator()
+        self.current_base_height = _BASE_HEIGHT_INIT
+
+        # Foot-tracker navigate_cmd state
+        self.navigate_cmd_source = navigate_cmd_source  # "tracker" | "joystick" | "auto"
+        self._prev_pelvis_robot: np.ndarray | None = None
+        self._prev_pelvis_yaw: float = 0.0
 
     def reset_yaw(self):
         """Called when entering pose mode. Resets yaw only.
@@ -1263,6 +1382,8 @@ class PoseStreamer:
         self.next_target_ns = None
         self.buffer_cleared = True
         self.step = 0
+        self._prev_pelvis_robot = None
+        self._prev_pelvis_yaw = 0.0
 
     def run_once(self):
         """Execute one iteration of the pose streaming loop."""
@@ -1429,9 +1550,49 @@ class PoseStreamer:
             # Buffer is now full with fresh data, can start sending
             self.buffer_cleared = False
 
-        # Get joystick axes for yaw accumulation
-        _, _, rx, _ = get_controller_axes()
+        # Get joystick axes for yaw accumulation and navigate_cmd
+        lx, ly, rx, ry = get_controller_axes()
         self.yaw_accumulator.update(rx, self.frame_time)
+
+        # Update base height from face buttons (Y = up, X = down), same as pico_streamer.py
+        # x_pressed / y_pressed already read above via get_abxy_buttons()
+        if y_pressed:
+            self.current_base_height = min(_BASE_HEIGHT_MAX, self.current_base_height + _BASE_HEIGHT_STEP)
+        elif x_pressed:
+            self.current_base_height = max(_BASE_HEIGHT_MIN, self.current_base_height - _BASE_HEIGHT_STEP)
+
+        # --- joystick-based navigate_cmd (matching decoupled_wbc pico_streamer.py) ----------
+        #   lin_vel_x = dead_zone(left_axis[1])  * MAX_LIN_VEL  (forward/back)
+        #   lin_vel_y = dead_zone(-left_axis[0]) * MAX_LIN_VEL  (strafe)
+        #   ang_vel_z = dead_zone(-right_axis[0])* MAX_ANG_VEL  (yaw)
+        navigate_cmd_joystick = np.array([
+            _nav_dead_zone(ly)  * _NAV_MAX_LIN_VEL,
+            _nav_dead_zone(-lx) * _NAV_MAX_LIN_VEL,
+            _nav_dead_zone(-rx) * _NAV_MAX_ANG_VEL,
+        ], dtype=np.float32)
+
+        # --- pelvis-based navigate_cmd (from SMPL joint 0 absolute position; needs foot trackers) ---
+        navigate_cmd_pelvis, pelvis_available = _pelvis_navigate_cmd(
+            sample["body_poses_np"],
+            self._prev_pelvis_robot,
+            self._prev_pelvis_yaw,
+            sample.get("dt", self.frame_time),
+        )
+        self._prev_pelvis_robot, self._prev_pelvis_yaw = _pelvis_robot_state(sample["body_poses_np"])
+        # NaN when unavailable so downstream code can detect missing data
+        if not pelvis_available:
+            navigate_cmd_pelvis = _PELVIS_NAV_UNAVAILABLE.copy()
+
+        # --- pelvis-based base height (Z in robot frame = up; absolute Unity world metres) ---
+        base_height_cmd_pelvis, _ = _pelvis_height_cmd(sample.get("body_poses_np"))
+
+        # Select navigate_cmd (active source) based on configured source
+        if self.navigate_cmd_source == "joystick":
+            navigate_cmd = navigate_cmd_joystick
+        elif self.navigate_cmd_source == "pelvis":
+            navigate_cmd = navigate_cmd_pelvis if pelvis_available else navigate_cmd_joystick
+        else:  # "auto": pelvis when available, joystick fallback
+            navigate_cmd = navigate_cmd_pelvis if pelvis_available else navigate_cmd_joystick
 
         # Only send if buffer is full and we're not waiting for fresh data
         if buffer_is_full and not self.buffer_cleared:
@@ -1463,6 +1624,11 @@ class PoseStreamer:
                 "heading_increment": np.array(
                     [self.yaw_accumulator.yaw_angle_change()], dtype=np.float32
                 ),
+                "navigate_cmd": navigate_cmd,
+                "navigate_cmd_joystick": navigate_cmd_joystick,
+                "navigate_cmd_pelvis": navigate_cmd_pelvis,  # NaN [3] when foot trackers unavailable
+                "base_height_cmd_joystick": np.array([self.current_base_height], dtype=np.float32),
+                "base_height_cmd_pelvis": base_height_cmd_pelvis,  # NaN [1] when foot trackers unavailable
             }
 
             packed_message = pack_pose_message(numpy_data, topic="pose")
@@ -1814,6 +1980,7 @@ def run_pico_manager(
     with_g1_robot: bool = True,
     enable_waist_tracking: bool = False,
     enable_smpl_vis: bool = False,
+    navigate_cmd_source: str = "pelvis",
 ):
     """
     Manager: creates shared PUB socket and runs pose/planner streamers based on current mode.
@@ -1868,6 +2035,7 @@ def run_pico_manager(
         record_dir=record_dir,
         record_format=record_format,
         log_prefix="PoseLoop",
+        navigate_cmd_source=navigate_cmd_source,
     )
     planner_streamer = PlannerStreamer(
         socket=socket,
@@ -2136,6 +2304,20 @@ if __name__ == "__main__":
         action="store_true",
         help="Enable SMPL body joint visualization (24 joint spheres) in the VR3pt viewer",
     )
+    parser.add_argument(
+        "--navigate_cmd_source",
+        type=str,
+        default="pelvis",
+        choices=["pelvis", "joystick", "auto"],
+        help=(
+            "Source for the active navigate_cmd [vx, vy, ω] field: "
+            "'pelvis' = foot-tracker pelvis velocity (default; falls back to joystick when unavailable), "
+            "'joystick' = left/right joystick axes only, "
+            "'auto' = pelvis when available, joystick fallback. "
+            "Both navigate_cmd_joystick and navigate_cmd_pelvis are always recorded; "
+            "navigate_cmd_pelvis contains NaN when foot trackers are not available."
+        ),
+    )
     args = parser.parse_args()
 
     # Standalone VR3Pt test modes (exit after finishing)
@@ -2176,6 +2358,7 @@ if __name__ == "__main__":
             with_g1_robot=with_g1_robot,
             enable_waist_tracking=args.waist_tracking,
             enable_smpl_vis=args.vis_smpl,
+            navigate_cmd_source=args.navigate_cmd_source,
         )
     else:
         # Run legacy single-thread pose streaming

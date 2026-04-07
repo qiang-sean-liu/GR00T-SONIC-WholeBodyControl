@@ -18,8 +18,50 @@ Complete the [Quick Start](../getting_started/quickstart), [PICO Setup](../getti
 | PICO pose | 5556 | `pose` | Human motion (SMPL pose, VR 3-point), controller inputs, hand joints |
 | SONIC output | 5557 | `g1_debug` | WBC target/measured joint positions, VR data (heading-corrected) |
 | Sim cameras | 5555 | — | JPEG frames from MuJoCo head cameras |
+| Base state | 5558 | `base_state` | Ground-truth base position/velocity from MuJoCo physics |
 
 Recording is controlled directly from the PICO headset — no keyboard interaction needed.
+
+---
+
+## Lower Body Control Modes
+
+SONIC supports two lower body control modes, toggled at runtime from the PICO controller — no restart needed.
+
+### POSE mode (default — SMPL / foot tracker driven)
+
+In POSE mode the robot's lower body is driven by **SMPL body fitting** of the operator's full tracked pose (feet, knees, waist via foot trackers). The pipeline:
+
+1. Foot trackers + PICO body tracking → SMPL fit: 24 joint positions in absolute world space
+2. SMPL data → pose message (protocol v3) → ZMQ to deploy
+3. Deploy-side encoder TRT model builds `smpl_joints_lower_10frame_step1` (9 lower joints × 10 frames = 270 observations)
+4. SONIC policy generates leg joint torques from those observations
+5. In MuJoCo: torques → ground contact forces → base translates
+
+The result is that **the G1 robot mirrors your physical motion directly** — walking, squatting, kneeling, even walking across the room — without any joystick navigation command. The foot trackers are the key input; no explicit `navigate_cmd` is required for locomotion to occur.
+
+`navigate_cmd_pelvis` records the pelvis velocity (derived from SMPL joint 0 absolute world position) as a proxy for locomotion intent in each frame. When foot trackers are not worn, `navigate_cmd_pelvis` is set to `NaN [3]` and `navigate_cmd` falls back to the joystick source.
+
+### PLANNER_VR_3PT mode (kinematic planner driven)
+
+In PLANNER_VR_3PT mode only **upper body tracking** (L-wrist, R-wrist, Neck) is sent via VR 3-point positions/orientations. A separate kinematic planner network (10 Hz) generates lower body joint trajectories from:
+
+- **`movement_direction`** — left joystick X/Y
+- **`speed`** — left joystick magnitude
+- **`mode`** — from controller state
+
+In this mode, locomotion requires **explicit joystick input** — walking without moving the joystick produces no lower body motion. `navigate_cmd_joystick` is the relevant field for training.
+
+### Controller mode-switching (no restart needed)
+
+| Buttons | Action |
+|---------|--------|
+| `A+B+X+Y` | Start policy (OFF → PLANNER) / stop (any mode → OFF) |
+| `A+X` | Toggle POSE ↔ PLANNER |
+| `B+Y` | Toggle POSE ↔ PLANNER_FROZEN_UPPER_BODY |
+| `left_axis_click` | Toggle PLANNER ↔ PLANNER_VR_3PT (within the active planner chain) |
+
+For data collection, **POSE mode is recommended** when the task benefits from natural whole-body motion and the operator wears foot trackers. Use PLANNER_VR_3PT when precise joystick-driven navigation to a location is needed.
 
 ---
 
@@ -28,18 +70,20 @@ Recording is controlled directly from the PICO headset — no keyboard interacti
 Follow the [Teleoperation Guide](teleoperation.md#running-mujoco-teleop) to bring up Terminals 1–4,
 then add Terminal 5 for the recorder.
 
-**Terminal 1 — MuJoCo Simulator** (with image publishing enabled):
+**Terminal 1 — MuJoCo Simulator** (with image publishing and base state stream enabled):
 ```bash
 source .venv_teleop/bin/activate
 python gear_sonic/scripts/run_sim_loop.py \
-    --env_name pnp_cube \
+    --env_name kitchen_pnp_apple \
     --head_cam \
     --enable_image_publish \
-    --enable_offscreen
+    --enable_offscreen \
+    --base_state_port 5558
 ```
 
 `--head_cam` renders stereo head cameras; `--enable_image_publish` publishes them over ZMQ on
-port 5555. Without these flags, no camera images are saved.
+port 5555. Without these flags, no camera images are saved. `--base_state_port 5558` streams
+ground-truth base position/velocity from MuJoCo (ZMQ port 5558); omit to disable.
 
 **Terminal 2 — C++ WBC + SONIC**:
 ```bash
@@ -49,11 +93,28 @@ bash deploy.sh sim --input-type zmq_manager
 ```
 
 **Terminal 3 — PICO Manager**:
+
+POSE mode (default — foot-tracker SMPL drives lower body; pelvis velocity used as `navigate_cmd`):
 ```bash
 source .venv_teleop/bin/activate
 python gear_sonic/scripts/pico_manager_thread_server.py --manager \
-    --waist_tracking --vis_vr3pt
+    --waist_tracking --vis_vr3pt --vis_smpl
 ```
+
+To force joystick as the navigate_cmd source instead of pelvis (e.g. when not wearing foot trackers):
+```bash
+python gear_sonic/scripts/pico_manager_thread_server.py --manager \
+    --waist_tracking --vis_vr3pt \
+    --navigate_cmd_source joystick
+```
+
+The `--navigate_cmd_source` option controls the **active** `navigate_cmd` field only.
+`navigate_cmd_joystick` and `navigate_cmd_pelvis` are **always** recorded regardless of this setting;
+`navigate_cmd_pelvis` contains `NaN` when foot trackers are not available.
+
+To switch to PLANNER_VR_3PT mode at runtime (no restart needed), use the PICO controller buttons
+described in [Lower Body Control Modes](#lower-body-control-modes) above. The same Terminal 3
+command is used for all modes — mode switching happens live via controller input.
 
 **Terminal 4 — Headset Video Stream** (optional — stream head cam to PICO):
 ```bash
@@ -72,6 +133,42 @@ To skip camera images (faster, smaller files):
 ```bash
 python gear_sonic/scripts/record_sonic_teleop.py --output_dir ./recordings --no_images
 ```
+
+**After recording — convert to LeRobot training format:**
+
+`convert_sonic_to_lerobot.py` reads the raw NPZ + JPEG episodes saved by the recorder and
+writes a LeRobot dataset (HuggingFace Parquet + H.264 MP4) ready for GR00T N1.5/N1.6
+training. It downsamples the ~50 Hz PICO stream to 20 Hz, assembles the 43-DOF state/action
+vectors, encodes camera frames as video, and writes the modality config and episode metadata.
+
+The `--task` argument is required — it supplies the language instruction that was not recorded
+during collection and is written to `meta/tasks.jsonl`.
+
+```bash
+# Convert all episodes in a recording directory (with stereo head camera videos):
+conda run -n sonic_dc python gear_sonic/scripts/convert_sonic_to_lerobot.py \
+    --input_dir ./recordings \
+    --output_dir ./lerobot_dataset \
+    --task "Pick up apple from table to plate" \
+    --fps 20
+
+# Without images (faster; suitable when recorded with --no_images):
+conda run -n sonic_dc python gear_sonic/scripts/convert_sonic_to_lerobot.py \
+    --input_dir ./recordings \
+    --output_dir ./lerobot_dataset \
+    --task "Pick up apple from table to plate" \
+    --no_images
+
+# Append a second session to an existing dataset (episodes are numbered sequentially):
+conda run -n sonic_dc python gear_sonic/scripts/convert_sonic_to_lerobot.py \
+    --input_dir ./recordings_session2 \
+    --output_dir ./lerobot_dataset \
+    --task "Pick up apple from table to plate" \
+    --append
+```
+
+See [Converting to GR00T Training Format](#converting-to-groot-training-format) for the full
+field mapping, options table, and notes on backward compatibility with older recordings.
 
 ---
 
@@ -97,6 +194,7 @@ frames, and confirmation when an episode is saved.
 | `--pose_port` | `5556` | ZMQ port for PICO pose stream |
 | `--sonic_port` | `5557` | ZMQ port for SONIC g1_debug stream |
 | `--image_port` | `5555` | ZMQ port for simulator camera images |
+| `--base_state_port` | `5558` | ZMQ port for ground-truth base state from MuJoCo (`0` = disabled) |
 | `--host` | `localhost` | Host for ZMQ connections |
 | `--no_images` | off | Skip camera image recording |
 
@@ -123,20 +221,32 @@ Each episode is saved as a separate subdirectory named by wall-clock time and se
 
 | Key | Shape | Content |
 |-----|-------|---------|
-| `smpl_pose` | `[T, N, 72]` | SMPL body pose params (N frames buffered per tick) |
-| `smpl_joints` | `[T, N, J, 3]` | SMPL joint positions |
+| `smpl_pose` | `[T, N, 21, 3]` | SMPL body pose — axis-angle per joint (N frames buffered per tick; J=21 joints) |
+| `smpl_joints` | `[T, N, 24, 3]` | SMPL joint positions in absolute world space (J=24, joint 0 = pelvis) |
 | `body_quat_w` | `[T, N, 4]` | Body root quaternion (w-first) |
-| `joint_pos` | `[T, N, 29]` | G1 joint positions from motion retargeting |
+| `joint_pos` | `[T, N, 29]` | G1 joint positions from SMPL motion retargeting |
 | `joint_vel` | `[T, N, 29]` | G1 joint velocities (zeros in current pico_manager) |
+| `frame_index` | `[T, N]` | Frame indices for the N buffered frames |
 | `vr_position` | `[T, 9]` | VR 3-point positions: [L-wrist, R-wrist, Neck] × xyz |
 | `vr_orientation` | `[T, 12]` | VR 3-point orientations: [L, R, Neck] × wxyz |
-| `left_hand_joints` | `[T, 7]` | Left Dex3 hand joint positions |
-| `right_hand_joints` | `[T, 7]` | Right Dex3 hand joint positions |
+| `left_hand_joints` | `[T, 7]` | Left Dex3 hand joint target positions (from trigger mapping) |
+| `right_hand_joints` | `[T, 7]` | Right Dex3 hand joint target positions (from trigger mapping) |
 | `left_trigger` / `right_trigger` | `[T, 1]` | Controller trigger values |
 | `left_grip` / `right_grip` | `[T, 1]` | Controller grip values |
+| `pico_dt` | `[T, 1]` | Frame delta time (s) — reciprocal of `pico_fps` |
+| `pico_fps` | `[T, 1]` | PICO stream rate (Hz) for that frame |
 | `timestamp_realtime` | `[T, 1]` | Wall-clock timestamp (s) |
 | `timestamp_monotonic` | `[T, 1]` | Monotonic timestamp (s) |
 | `heading_increment` | `[T, 1]` | Yaw accumulator change since last tick (rad) |
+| `toggle_data_collection` | `[T, 1]` | Rising-edge signal used to start/stop episode recording |
+| `toggle_data_abort` | `[T, 1]` | Rising-edge signal used to abort and discard current episode |
+| `navigate_cmd` | `[T, 3]` | Active navigate command `[vx, vy, ω_z]` (m/s, m/s, rad/s) — source controlled by `--navigate_cmd_source` |
+| `navigate_cmd_joystick` | `[T, 3]` | Joystick-derived navigate command (always recorded) |
+| `navigate_cmd_pelvis` | `[T, 3]` | Foot-tracker-derived navigate command from pelvis velocity (NaN `[3]` when foot trackers unavailable) |
+| `base_height_cmd_joystick` | `[T, 1]` | Button-driven pelvis height (m); Y raises (+1 cm), X lowers (−1 cm); range 0.20–0.74 m |
+| `base_height_cmd_pelvis` | `[T, 1]` | SMPL pelvis Z in robot frame — operator's absolute pelvis height above Unity world origin (m); NaN when foot trackers unavailable |
+
+> **Note:** `navigate_cmd`, `navigate_cmd_joystick`, `navigate_cmd_pelvis`, `base_height_cmd_joystick`, and `base_height_cmd_pelvis` are present only in recordings made after the pico_manager update that added these fields. Older recordings will not have these keys; the conversion script substitutes zeros / default height (0.74 m) for missing fields.
 
 ### `sonic.npz` — shape `[T, ...]`, sampled at pose rate from the g1_debug ZMQ stream
 
@@ -162,6 +272,15 @@ Each episode is saved as a separate subdirectory named by wall-clock time and se
 | `vr_3point_orientation` | `[T, 12]` | Wrist and neck orientations — [L-wrist, R-wrist, Neck] × wxyz quaternion |
 | `vr_3point_compliance` | `[T, 3]` | Per-limb tracking compliance — [L-arm, R-arm, head] |
 
+**Ground-truth simulation state** (requires `--base_state_port 5558` on `run_sim_loop.py` and `record_sonic_teleop.py`):
+
+| Key | Shape | Content |
+|-----|-------|---------|
+| `base_pos_sim` | `[T, 3]` | Ground-truth base XYZ position from MuJoCo world frame (m) |
+| `base_quat_sim` | `[T, 4]` | Ground-truth base quaternion wxyz from MuJoCo |
+| `base_linvel_sim` | `[T, 3]` | Ground-truth base linear velocity from MuJoCo world frame (m/s) |
+| `base_angvel_sim` | `[T, 3]` | Ground-truth base angular velocity from MuJoCo world frame (rad/s) |
+
 **Reference targets** — joint positions and base pose derived from SMPL motion retargeting,
 heading-corrected. These are the targets the WBC control loop is commanded to track;
 they are **inputs to SONIC**, not its output:
@@ -182,6 +301,93 @@ they are **inputs to SONIC**, not its output:
 JPEG files at simulator camera rate, organized by camera name and frame index.
 Images are stored as-is from the simulator (quality 80 JPEG, 640×480). The frame index in the
 filename corresponds to the pose tick at which that image was latest available.
+
+---
+
+## Converting to GR00T Training Format
+
+GR00T N1.5/N1.6 training consumes **LeRobot** datasets (HuggingFace Parquet + H.264 MP4), not raw NPZ files. Use `convert_sonic_to_lerobot.py` to convert.
+
+### Usage
+
+The script requires `lerobot`, `av`, and `pyarrow`, which are available in the `sonic_dc` conda environment.
+
+**Convert all episodes in a directory:**
+```bash
+conda run -n sonic_dc python gear_sonic/scripts/convert_sonic_to_lerobot.py \
+    --input_dir ./recordings \
+    --output_dir ./lerobot_dataset \
+    --task "Pick up apple from table to plate" \
+    --fps 20
+```
+
+**Convert a single episode directory:**
+```bash
+conda run -n sonic_dc python gear_sonic/scripts/convert_sonic_to_lerobot.py \
+    --input_dir ./recordings/20260401_115515_ep0002 \
+    --output_dir ./lerobot_dataset \
+    --task "Pick up apple from table to plate"
+```
+
+**Skip image encoding (faster, smaller output):**
+```bash
+conda run -n sonic_dc python gear_sonic/scripts/convert_sonic_to_lerobot.py \
+    --input_dir ./recordings \
+    --output_dir ./lerobot_dataset \
+    --task "Pick up apple from table to plate" \
+    --no_images
+```
+
+**Append a second session to an existing dataset:**
+```bash
+conda run -n sonic_dc python gear_sonic/scripts/convert_sonic_to_lerobot.py \
+    --input_dir ./recordings_session2 \
+    --output_dir ./lerobot_dataset \
+    --task "Pick up apple from table to plate" \
+    --append
+```
+
+### Conversion options
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--input_dir` | *(required)* | Recording directory (or a single episode dir) |
+| `--output_dir` | *(required)* | LeRobot dataset root (created if absent) |
+| `--task` | *(required)* | Language task description (written to `tasks.jsonl`) |
+| `--fps` | `20` | Output frame rate after downsampling from ~50 Hz PICO rate |
+| `--no_images` | off | Skip H.264 video encoding even if `images/` dirs are present |
+| `--append` | off | Append to an existing dataset rather than creating a new one |
+| `--robot_type` | `g1` | Robot type string written to `meta/info.json` |
+
+### What the script assembles
+
+The SONIC 29-DOF body joint order in `body_q_measured`/`body_q_target` is:
+`[left_leg(6), right_leg(6), waist(3), left_arm(7), right_arm(7)]`
+
+The 43-DOF layout expected by GR00T training inserts left and right hands after their
+respective arms: `[left_leg(6), right_leg(6), waist(3), left_arm(7), left_hand(7), right_arm(7), right_hand(7)]`
+
+| Training field | Shape | Source |
+|---|---|---|
+| `observation.state` | `[T, 43]` | `body_q_meas[0:22] ‖ lh_meas[7] ‖ body_q_meas[22:29] ‖ rh_meas[7]` |
+| `action` | `[T, 43]` | `body_q_tgt[0:22] ‖ pico.left_hand_joints[7] ‖ body_q_tgt[22:29] ‖ pico.right_hand_joints[7]` |
+| `observation.eef_state` / `action.eef` | `[T, 14]` | `vr_3pt_pos[0:6] ‖ vr_3pt_ori[0:8]` (L+R wrist, neck dropped) |
+| `teleop.navigate_command` | `[T, 3]` | `pico: navigate_cmd` (zeros if not in recording) |
+| `teleop.base_height_command` | `[T, 1]` | `pico: base_height_cmd_joystick` (0.74 m default if not in recording) |
+| `observation.images.*` | video | `images/` JPEGs → H.264 MP4 at `--fps` |
+| `task_index` | `[T, 1]` | From `--task` argument; written to `meta/tasks.jsonl` |
+
+Timestamps are resampled from the variable PICO rate (~50 Hz) to the target `--fps` using nearest-neighbour interpolation on `pico.npz` `timestamp_realtime`.
+
+### Key differences from decoupled_wbc collection
+
+| Aspect | decoupled_wbc (gr00t_wbc) | SONIC (gear_sonic) |
+|---|---|---|
+| Output format | Parquet + H.264 MP4 | NPZ + JPEG → convert with this script |
+| Ready for training | Yes — written during collection | No — one conversion pass required |
+| Collection rate | 20 Hz | ~50 Hz (PICO); downsampled at conversion |
+| Language annotation | Saved at collection time | Supplied via `--task` at conversion time |
+| DOF layout | 43-DOF concatenated | 29-body + 7+7 hands reassembled by the script |
 
 ---
 
@@ -320,13 +526,14 @@ name maps to a Python class that points to a MuJoCo XML scene file.
 Replace `--env_name` with whichever environment you want:
 
 ```bash
-# Kitchen pick-and-place scene (apple → plate), with stereo head cameras
+# Kitchen pick-and-place scene (apple → plate), with stereo head cameras and base state stream
 source .venv_teleop/bin/activate
 python gear_sonic/scripts/run_sim_loop.py \
     --env_name kitchen_pnp_apple \
     --head_cam \
     --enable_image_publish \
-    --enable_offscreen
+    --enable_offscreen \
+    --base_state_port 5558
 ```
 
 All other terminals (WBC, PICO manager, recorder) are started exactly as described in
@@ -433,7 +640,8 @@ python gear_sonic/scripts/run_sim_loop.py \
     --env_name my_scene \
     --head_cam \
     --enable_image_publish \
-    --enable_offscreen
+    --enable_offscreen \
+    --base_state_port 5558
 
 # Terminal 5 — recorder (unchanged)
 python gear_sonic/scripts/record_sonic_teleop.py \
@@ -480,14 +688,15 @@ python gear_sonic/scripts/run_sim_loop.py \
     --env_name kitchen_pnp_apple \
     --head_cam \
     --enable_image_publish \
-    --enable_offscreen
+    --enable_offscreen \
+    --base_state_port 5558
 
 # Terminal 2 — WBC (unchanged)
 cd gear_sonic_deploy
 source scripts/setup_env.sh
 bash deploy.sh sim --input-type zmq_manager
 
-# Terminal 3 — PICO manager (unchanged)
+# Terminal 3 — PICO manager (POSE mode, pelvis navigate_cmd)
 source .venv_teleop/bin/activate
 python gear_sonic/scripts/pico_manager_thread_server.py --manager \
     --waist_tracking --vis_vr3pt

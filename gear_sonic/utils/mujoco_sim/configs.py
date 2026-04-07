@@ -345,5 +345,8 @@ class SimLoopConfig(BaseConfig):
     head_cam: bool = False
     """Stream MuJoCo head_camera frames to PICO via vuer ImageBackground (stream_cam.py)."""
 
+    base_state_port: int = 5558
+    """ZMQ port for ground-truth base position/velocity stream (0 = disabled)."""
+
     verbose: bool = False
     """Verbose output, override the base config verbose"""

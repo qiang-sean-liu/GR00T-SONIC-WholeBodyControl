@@ -17,6 +17,7 @@ import xml.etree.ElementTree as ET
 
 import mujoco
 import mujoco.viewer
+import msgpack
 import numpy as np
 from scipy.spatial.transform import Rotation
 from unitree_sdk2py.core.channel import ChannelFactoryInitialize
@@ -41,6 +42,7 @@ class DefaultEnv:
         offscreen: bool = False,
         enable_image_publish: bool = False,
         head_cam_shm_name: str = "",
+        base_state_port: int = 0,
     ):
         self.config = config
         self.env_name = env_name
@@ -59,6 +61,19 @@ class DefaultEnv:
 
         self.init_scene()
         self.last_reward = 0
+
+        # ZMQ publisher for ground-truth base state (position, quaternion, velocity).
+        # Disabled when base_state_port == 0.
+        self._base_state_pub = None
+        self._base_state_ctx = None
+        if base_state_port > 0:
+            import zmq as _zmq
+            self._base_state_ctx = _zmq.Context()
+            self._base_state_pub = self._base_state_ctx.socket(_zmq.PUB)
+            self._base_state_pub.setsockopt(_zmq.SNDHWM, 10)
+            self._base_state_pub.setsockopt(_zmq.LINGER, 0)
+            self._base_state_pub.bind(f"tcp://*:{base_state_port}")
+            print(f"[DefaultEnv] base_state publisher: tcp://*:{base_state_port}")
 
         self.offscreen = offscreen
         if self.offscreen:
@@ -434,6 +449,21 @@ class DefaultEnv:
     def sim_step(self):
         self.obs = self.prepare_obs()
         self.unitree_bridge.PublishLowState(self.obs)
+        if self._base_state_pub is not None and self.use_floating_root_link:
+            _pos = self.mj_data.qpos[:3].tolist()
+            _quat = self.mj_data.qpos[3:7].tolist()   # wxyz in MuJoCo convention
+            _linvel = self.mj_data.qvel[:3].tolist()   # world-frame linear velocity
+            _angvel = self.mj_data.qvel[3:6].tolist()  # world-frame angular velocity
+            _payload = msgpack.packb({
+                "base_pos_sim": _pos,
+                "base_quat_sim": _quat,
+                "base_linvel_sim": _linvel,
+                "base_angvel_sim": _angvel,
+            })
+            try:
+                self._base_state_pub.send(b"base_state" + _payload, copy=False)
+            except Exception:
+                pass
         if self.unitree_bridge.joystick:
             self.unitree_bridge.PublishWirelessController()
         if self.elastic_band:
@@ -611,6 +641,14 @@ class DefaultEnv:
         if self_collision:
             print(f"Warning: Self-collision detected: {contact_bodies}")
         return self_collision
+
+    def close(self):
+        if self._base_state_pub is not None:
+            self._base_state_pub.close()
+            self._base_state_pub = None
+        if self._base_state_ctx is not None:
+            self._base_state_ctx.term()
+            self._base_state_ctx = None
 
     def reset(self):
         mujoco.mj_resetData(self.mj_model, self.mj_data)
@@ -863,6 +901,7 @@ class BaseSimulator:
                 self.sim_env.head_cam_shm.close()
                 self.sim_env.head_cam_shm.unlink()
                 self.sim_env.head_cam_shm = None
+            self.sim_env.close()
         except Exception as e:
             print(f"Warning during close: {e}")
 
