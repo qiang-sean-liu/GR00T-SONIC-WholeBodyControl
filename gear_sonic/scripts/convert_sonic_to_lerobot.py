@@ -136,6 +136,8 @@ def _build_parquet_schema(video_keys: list[str]) -> pa.Schema:
         pa.field("observation.img_state_delta", pa.float32()),
         pa.field("teleop.navigate_command",  pa.list_(pa.float64(), 3)),
         pa.field("teleop.base_height_command", pa.float64()),
+        pa.field("robot.base_pos",           pa.list_(pa.float64(), 3)),
+        pa.field("robot.base_quat",          pa.list_(pa.float64(), 4)),
         pa.field("timestamp",                pa.float32()),
         pa.field("frame_index",              pa.int64()),
         pa.field("episode_index",            pa.int64()),
@@ -277,6 +279,15 @@ def _compute_stats(arrays: dict[str, list[np.ndarray]]) -> dict[str, dict]:
 # Single-episode conversion
 # ---------------------------------------------------------------------------
 
+def _read_episode_meta(ep_dir: Path) -> dict:
+    """Load meta.json from an episode directory (returns {} if absent)."""
+    meta_path = ep_dir / "meta.json"
+    if meta_path.exists():
+        with open(meta_path) as f:
+            return json.load(f)
+    return {}
+
+
 def _convert_episode(
     ep_dir: Path,
     out_dir: Path,
@@ -312,6 +323,8 @@ def _convert_episode(
     rh_meas       = sonic["right_hand_q_measured"]  # [T, 7]
     vr_pos        = sonic["vr_3point_position"]      # [T, 9]
     vr_ori        = sonic["vr_3point_orientation"]   # [T, 12]
+    base_pos      = sonic["base_pos_sim"]            # [T, 3] XYZ world frame
+    base_quat     = sonic["base_quat_sim"]           # [T, 4] wxyz world frame
 
     # pico hand targets — shape [T, 7]
     lh_tgt = pico["left_hand_joints"]   # always present
@@ -353,7 +366,8 @@ def _convert_episode(
     stat_accum: dict[str, list[np.ndarray]] = {
         k: [] for k in ["observation.state", "observation.eef_state",
                          "action", "action.eef",
-                         "teleop.navigate_command", "teleop.base_height_command"]
+                         "teleop.navigate_command", "teleop.base_height_command",
+                         "robot.base_pos", "robot.base_quat"]
     }
 
     for out_fi, si in enumerate(src_idx):
@@ -364,6 +378,9 @@ def _convert_episode(
         height = float(bh[si])
         timestamp = float(ts[si] - t0)
 
+        bp = base_pos[si].astype(np.float64)
+        bq = base_quat[si].astype(np.float64)
+
         rows["observation.state"].append(state.tolist())
         rows["observation.eef_state"].append(eef.tolist())
         rows["action"].append(action.tolist())
@@ -371,6 +388,8 @@ def _convert_episode(
         rows["observation.img_state_delta"].append(np.float32(0.0))
         rows["teleop.navigate_command"].append(nav.tolist())
         rows["teleop.base_height_command"].append(height)
+        rows["robot.base_pos"].append(bp.tolist())
+        rows["robot.base_quat"].append(bq.tolist())
         rows["timestamp"].append(np.float32(timestamp))
         rows["frame_index"].append(out_fi)
         rows["episode_index"].append(episode_index)
@@ -383,6 +402,8 @@ def _convert_episode(
         stat_accum["action.eef"].append(eef)
         stat_accum["teleop.navigate_command"].append(nav)
         stat_accum["teleop.base_height_command"].append(np.array([height]))
+        stat_accum["robot.base_pos"].append(bp)
+        stat_accum["robot.base_quat"].append(bq)
 
         # Images
         if encoders:
@@ -430,8 +451,9 @@ def _parse_args() -> argparse.Namespace:
                    help="Directory containing episode subdirectories (or a single episode dir).")
     p.add_argument("--output_dir", required=True, type=Path,
                    help="Root directory for the LeRobot dataset (created if absent).")
-    p.add_argument("--task", required=True,
-                   help="Language task description, e.g. 'Pick up apple from table to plate'.")
+    p.add_argument("--task", default=None,
+                   help="Language task description. If omitted, read from each episode's meta.json "
+                        "(set by record_sonic_teleop.py --task). Required if meta.json has no task.")
     p.add_argument("--fps", type=float, default=20.0,
                    help="Target frame rate for the output dataset (default: 20 Hz).")
     p.add_argument("--no_images", action="store_true",
@@ -481,36 +503,36 @@ def main() -> None:
     ep_stats_path = meta_dir / "episodes_stats.jsonl"
     modality_path = meta_dir / "modality.json"
 
+    # task_registry maps task_str -> task_index; populated from tasks.jsonl when appending
+    task_registry: dict[str, int] = {}
+
     if args.append and info_path.exists():
         with open(info_path) as f:
             info = json.load(f)
-        # Load existing task index
-        task_index = None
         with open(tasks_path) as f:
             for line in f:
                 rec = json.loads(line)
-                if rec["task"] == args.task:
-                    task_index = rec["task_index"]
-                    break
-        if task_index is None:
-            # New task in existing dataset
-            n_existing_tasks = info["total_tasks"]
-            task_index = n_existing_tasks
-            with open(tasks_path, "a") as f:
-                f.write(json.dumps({"task_index": task_index, "task": args.task}) + "\n")
-            info["total_tasks"] += 1
+                task_registry[rec["task"]] = rec["task_index"]
         start_episode = info["total_episodes"]
         start_frame = info["total_frames"]
     else:
-        # Fresh dataset
-        task_index = 0
+        # Fresh dataset — tasks.jsonl written per-episode below
         start_episode = 0
         start_frame = 0
-        # Write tasks.jsonl
-        with open(tasks_path, "w") as f:
-            f.write(json.dumps({"task_index": task_index, "task": args.task}) + "\n")
+        tasks_path.write_text("")  # empty file; entries appended per episode
 
-        # Build features dict for info.json
+    def _resolve_task_index(task_str: str) -> int:
+        """Return existing task_index or register a new one."""
+        if task_str in task_registry:
+            return task_registry[task_str]
+        new_idx = len(task_registry)
+        task_registry[task_str] = new_idx
+        with open(tasks_path, "a") as f:
+            f.write(json.dumps({"task_index": new_idx, "task": task_str}) + "\n")
+        return new_idx
+
+    # Build features dict for info.json (only for fresh datasets)
+    if not (args.append and info_path.exists()):
         features: dict[str, Any] = {
             "observation.state":         {"dtype": "float64", "shape": [43], "names": None},
             "observation.eef_state":     {"dtype": "float64", "shape": [14], "names": None},
@@ -521,6 +543,10 @@ def main() -> None:
                                           "names": ["lin_vel_x", "lin_vel_y", "ang_vel_z"]},
             "teleop.base_height_command":{"dtype": "float64", "shape": [1],
                                           "names": "base_height_command"},
+            "robot.base_pos":            {"dtype": "float64", "shape": [3],
+                                          "names": ["x", "y", "z"]},
+            "robot.base_quat":           {"dtype": "float64", "shape": [4],
+                                          "names": ["w", "x", "y", "z"]},
             "timestamp":   {"dtype": "float32", "shape": [1], "names": None},
             "frame_index": {"dtype": "int64",   "shape": [1], "names": None},
             "episode_index":{"dtype":"int64",   "shape": [1], "names": None},
@@ -538,7 +564,7 @@ def main() -> None:
             "robot_type": args.robot_type,
             "total_episodes": 0,
             "total_frames": 0,
-            "total_tasks": 1,
+            "total_tasks": 0,
             "total_videos": 0,
             "total_chunks": 0,
             "chunks_size": _CHUNKS_SIZE,
@@ -572,14 +598,28 @@ def main() -> None:
 
         for local_i, ep_dir in enumerate(episodes):
             ep_idx = start_episode + local_i
-            print(f"  [{local_i+1}/{len(episodes)}] {ep_dir.name}  →  episode_{ep_idx:06d}")
+
+            # Resolve task string: CLI flag takes precedence; fall back to meta.json
+            ep_meta = _read_episode_meta(ep_dir)
+            task_str = args.task or ep_meta.get("task") or ""
+            if not task_str:
+                sys.exit(
+                    f"[ERROR] No task description for {ep_dir.name}. "
+                    "Pass --task or re-record with record_sonic_teleop.py --task <description>."
+                )
+            ep_task_index = _resolve_task_index(task_str)
+            ep_env_name = ep_meta.get("env_name", "")
+
+            print(f"  [{local_i+1}/{len(episodes)}] {ep_dir.name}  →  episode_{ep_idx:06d}"
+                  f"  task='{task_str}'"
+                  + (f"  env={ep_env_name}" if ep_env_name else ""))
 
             n_frames, stats = _convert_episode(
                 ep_dir=ep_dir,
                 out_dir=out_dir,
                 episode_index=ep_idx,
                 global_frame_offset=start_frame + total_new_frames,
-                task_index=task_index,
+                task_index=ep_task_index,
                 fps=args.fps,
                 include_images=(not args.no_images),
                 video_keys=video_keys,
@@ -589,7 +629,7 @@ def main() -> None:
             total_new_frames += n_frames
             ep_f.write(json.dumps({
                 "episode_index": ep_idx,
-                "tasks": [args.task],
+                "tasks": [task_str],
                 "length": n_frames,
             }) + "\n")
             st_f.write(json.dumps({

@@ -74,16 +74,24 @@ then add Terminal 5 for the recorder.
 ```bash
 source .venv_teleop/bin/activate
 python gear_sonic/scripts/run_sim_loop.py \
-    --env_name kitchen_pnp_apple \
+    --env_name pnp_cube \
     --head_cam \
     --enable_image_publish \
-    --enable_offscreen \
-    --base_state_port 5558
+    --enable_offscreen
 ```
 
-`--head_cam` renders stereo head cameras; `--enable_image_publish` publishes them over ZMQ on
-port 5555. Without these flags, no camera images are saved. `--base_state_port 5558` streams
-ground-truth base position/velocity from MuJoCo (ZMQ port 5558); omit to disable.
+`--env_name` selects the MuJoCo scene. `--head_cam` renders stereo head cameras;
+`--enable_image_publish` publishes them over ZMQ on port 5555. Without these flags, no camera
+images are saved. `--base_state_port` is optional (default 5558) — it streams ground-truth base
+position/velocity from MuJoCo; it is enabled automatically when the recorder requests it.
+
+```{admonition} Match --env_name to the recorder
+:class: warning
+Pass the **same** `--env_name` value to both `run_sim_loop.py` (Terminal 1) and
+`record_sonic_teleop.py` (Terminal 5). The recorder saves it to `meta.json` so the
+correct MuJoCo scene is automatically used during conversion and playback. A mismatch
+causes the wrong scene to be loaded for episode replay.
+```
 
 **Terminal 2 — C++ WBC + SONIC**:
 ```bash
@@ -126,12 +134,22 @@ python gear_sonic/scripts/stream_cam_xr.py
 ```bash
 source .venv_teleop/bin/activate
 python gear_sonic/scripts/record_sonic_teleop.py \
-    --output_dir ./recordings
+    --output_dir ./recordings \
+    --env_name pnp_cube \
+    --task "Pick up cube and place it in the bin"
 ```
+
+`--env_name` and `--task` are saved to each episode's `meta.json` and are used automatically
+by `convert_sonic_to_lerobot.py` and `playback_lerobot.py` — no need to re-specify them at
+conversion time.
 
 To skip camera images (faster, smaller files):
 ```bash
-python gear_sonic/scripts/record_sonic_teleop.py --output_dir ./recordings --no_images
+python gear_sonic/scripts/record_sonic_teleop.py \
+    --output_dir ./recordings \
+    --env_name pnp_cube \
+    --task "Pick up cube and place it in the bin" \
+    --no_images
 ```
 
 **After recording — convert to LeRobot training format:**
@@ -141,29 +159,33 @@ writes a LeRobot dataset (HuggingFace Parquet + H.264 MP4) ready for GR00T N1.5/
 training. It downsamples the ~50 Hz PICO stream to 20 Hz, assembles the 43-DOF state/action
 vectors, encodes camera frames as video, and writes the modality config and episode metadata.
 
-The `--task` argument is required — it supplies the language instruction that was not recorded
-during collection and is written to `meta/tasks.jsonl`.
+If `--env_name` and `--task` were passed to the recorder, `--task` can be omitted at
+conversion time — it is read directly from each episode's `meta.json`.
 
 ```bash
-# Convert all episodes in a recording directory (with stereo head camera videos):
+# Convert all episodes — task read from meta.json (set at recording time):
 conda run -n sonic_dc python gear_sonic/scripts/convert_sonic_to_lerobot.py \
     --input_dir ./recordings \
     --output_dir ./lerobot_dataset \
-    --task "Pick up apple from table to plate" \
+    --fps 20
+
+# Override or supply task explicitly (required for older recordings without meta.json task):
+conda run -n sonic_dc python gear_sonic/scripts/convert_sonic_to_lerobot.py \
+    --input_dir ./recordings \
+    --output_dir ./lerobot_dataset \
+    --task "Pick up cube and place it in the bin" \
     --fps 20
 
 # Without images (faster; suitable when recorded with --no_images):
 conda run -n sonic_dc python gear_sonic/scripts/convert_sonic_to_lerobot.py \
     --input_dir ./recordings \
     --output_dir ./lerobot_dataset \
-    --task "Pick up apple from table to plate" \
     --no_images
 
 # Append a second session to an existing dataset (episodes are numbered sequentially):
 conda run -n sonic_dc python gear_sonic/scripts/convert_sonic_to_lerobot.py \
     --input_dir ./recordings_session2 \
     --output_dir ./lerobot_dataset \
-    --task "Pick up apple from table to plate" \
     --append
 ```
 
@@ -191,6 +213,8 @@ frames, and confirmation when an episode is saved.
 | Flag | Default | Description |
 |------|---------|-------------|
 | `--output_dir` | `./recordings` | Root directory for saved episodes |
+| `--env_name` | `""` | MuJoCo scene used for this recording (e.g. `pnp_cube`). Saved to `meta.json`; used automatically by the converter and playback script. |
+| `--task` | `""` | Language task description (e.g. `"Pick up cube"`). Saved to `meta.json`; used automatically by the converter as `--task` default. |
 | `--pose_port` | `5556` | ZMQ port for PICO pose stream |
 | `--sonic_port` | `5557` | ZMQ port for SONIC g1_debug stream |
 | `--image_port` | `5555` | ZMQ port for simulator camera images |
@@ -214,7 +238,7 @@ Each episode is saved as a separate subdirectory named by wall-clock time and se
 │   │   └── ...
 │   └── head_camera_right/
 │       └── ...
-└── meta.json       -- n_frames, duration, timestamps, field lists
+└── meta.json       -- n_frames, duration, field lists, env_name, task
 ```
 
 ### `pico.npz` — shape `[T, ...]` where T = number of pose ticks recorded
@@ -312,12 +336,20 @@ GR00T N1.5/N1.6 training consumes **LeRobot** datasets (HuggingFace Parquet + H.
 
 The script requires `lerobot`, `av`, and `pyarrow`, which are available in the `sonic_dc` conda environment.
 
-**Convert all episodes in a directory:**
+**Convert all episodes in a directory (task from meta.json):**
 ```bash
 conda run -n sonic_dc python gear_sonic/scripts/convert_sonic_to_lerobot.py \
     --input_dir ./recordings \
     --output_dir ./lerobot_dataset \
-    --task "Pick up apple from table to plate" \
+    --fps 20
+```
+
+**Override or supply task explicitly (older recordings without meta.json task):**
+```bash
+conda run -n sonic_dc python gear_sonic/scripts/convert_sonic_to_lerobot.py \
+    --input_dir ./recordings \
+    --output_dir ./lerobot_dataset \
+    --task "Pick up cube and place it in the bin" \
     --fps 20
 ```
 
@@ -325,8 +357,7 @@ conda run -n sonic_dc python gear_sonic/scripts/convert_sonic_to_lerobot.py \
 ```bash
 conda run -n sonic_dc python gear_sonic/scripts/convert_sonic_to_lerobot.py \
     --input_dir ./recordings/20260401_115515_ep0002 \
-    --output_dir ./lerobot_dataset \
-    --task "Pick up apple from table to plate"
+    --output_dir ./lerobot_dataset
 ```
 
 **Skip image encoding (faster, smaller output):**
@@ -334,7 +365,6 @@ conda run -n sonic_dc python gear_sonic/scripts/convert_sonic_to_lerobot.py \
 conda run -n sonic_dc python gear_sonic/scripts/convert_sonic_to_lerobot.py \
     --input_dir ./recordings \
     --output_dir ./lerobot_dataset \
-    --task "Pick up apple from table to plate" \
     --no_images
 ```
 
@@ -343,7 +373,6 @@ conda run -n sonic_dc python gear_sonic/scripts/convert_sonic_to_lerobot.py \
 conda run -n sonic_dc python gear_sonic/scripts/convert_sonic_to_lerobot.py \
     --input_dir ./recordings_session2 \
     --output_dir ./lerobot_dataset \
-    --task "Pick up apple from table to plate" \
     --append
 ```
 
@@ -353,7 +382,7 @@ conda run -n sonic_dc python gear_sonic/scripts/convert_sonic_to_lerobot.py \
 |------|---------|-------------|
 | `--input_dir` | *(required)* | Recording directory (or a single episode dir) |
 | `--output_dir` | *(required)* | LeRobot dataset root (created if absent) |
-| `--task` | *(required)* | Language task description (written to `tasks.jsonl`) |
+| `--task` | *(from meta.json)* | Language task description (written to `tasks.jsonl`). Optional if the episode was recorded with `record_sonic_teleop.py --task`; required for older recordings. |
 | `--fps` | `20` | Output frame rate after downsampling from ~50 Hz PICO rate |
 | `--no_images` | off | Skip H.264 video encoding even if `images/` dirs are present |
 | `--append` | off | Append to an existing dataset rather than creating a new one |
@@ -374,8 +403,10 @@ respective arms: `[left_leg(6), right_leg(6), waist(3), left_arm(7), left_hand(7
 | `observation.eef_state` / `action.eef` | `[T, 14]` | `vr_3pt_pos[0:6] ‖ vr_3pt_ori[0:8]` (L+R wrist, neck dropped) |
 | `teleop.navigate_command` | `[T, 3]` | `pico: navigate_cmd` (zeros if not in recording) |
 | `teleop.base_height_command` | `[T, 1]` | `pico: base_height_cmd_joystick` (0.74 m default if not in recording) |
+| `robot.base_pos` | `[T, 3]` | `sonic: base_pos_sim` — ground-truth pelvis XYZ from MuJoCo world frame (m). Requires `--base_state_port` at recording time. |
+| `robot.base_quat` | `[T, 4]` | `sonic: base_quat_sim` — ground-truth pelvis quaternion wxyz from MuJoCo. Requires `--base_state_port` at recording time. |
 | `observation.images.*` | video | `images/` JPEGs → H.264 MP4 at `--fps` |
-| `task_index` | `[T, 1]` | From `--task` argument; written to `meta/tasks.jsonl` |
+| `task_index` | `[T, 1]` | From `--task` (CLI or `meta.json`); written to `meta/tasks.jsonl` |
 
 Timestamps are resampled from the variable PICO rate (~50 Hz) to the target `--fps` using nearest-neighbour interpolation on `pico.npz` `timestamp_realtime`.
 
@@ -506,6 +537,65 @@ The output is H.264 / yuv420p (re-encoded with ffmpeg for broad player compatibi
 
 ---
 
+## Replaying LeRobot Episodes in MuJoCo
+
+`playback_lerobot.py` kinematically replays a converted LeRobot episode directly in the MuJoCo
+simulator — no C++ WBC process or Unitree SDK needed. It reads `observation.state` (43-DOF joint
+positions) and `robot.base_pos` / `robot.base_quat` (root pose) from the Parquet file, sets
+`qpos` directly, and calls `mj_forward()` each frame. An optional video is rendered from any
+named camera in the scene.
+
+```{admonition} Root pose required for correct lower-body replay
+:class: note
+Without `robot.base_pos` / `robot.base_quat` the robot is fixed at a standing position and
+any locomotion during recording (including balance-stepping while stationary) will not be
+replayed — only arm movements will be visible. These columns are present when episodes are
+recorded with `--base_state_port` (the default).
+```
+
+### Usage
+
+```bash
+# Replay episode 0 with the MuJoCo viewer + save an MP4 (use the correct --env_name):
+conda run -n sonic_dc python gear_sonic/scripts/playback_lerobot.py \
+    --dataset_dir ./lerobot_dataset \
+    --episode 0 \
+    --env_name pnp_cube \
+    --output_video playback_ep0.mp4
+
+# Headless — video only, no GUI window:
+conda run -n sonic_dc python gear_sonic/scripts/playback_lerobot.py \
+    --dataset_dir ./lerobot_dataset \
+    --episode 0 \
+    --env_name pnp_cube \
+    --output_video playback_ep0.mp4 \
+    --no_viewer
+```
+
+### Options
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--dataset_dir` | *(required)* | LeRobot dataset root (must contain `data/` and `meta/`) |
+| `--episode` | `0` | Episode index to replay |
+| `--env_name` | `kitchen_pnp_apple` | MuJoCo scene to load. **Must match the scene used during recording.** |
+| `--output_video` | *(none)* | Path to save an MP4 (e.g. `playback_ep0.mp4`). Omit to skip. |
+| `--camera` | `overview` | Camera name for video rendering. Falls back to first available camera if not found. |
+| `--no_viewer` | off | Disable the interactive MuJoCo viewer window (headless rendering) |
+| `--fps` | `20` | Playback and video frame rate |
+| `--video_width` | `1280` | Video width in pixels |
+| `--video_height` | `720` | Video height in pixels |
+
+```{admonition} --env_name must match the recording
+:class: warning
+`--env_name` selects the MuJoCo XML scene used for replay. If it does not match the scene
+that was active during recording, the robot will be in the wrong environment (wrong objects,
+wrong camera positions). When episodes are recorded with `record_sonic_teleop.py --env_name`,
+the correct value is stored in `meta.json` of each episode directory.
+```
+
+---
+
 ## Customizing Simulation Scenes
 
 The simulator environment is selected with `--env_name` on `run_sim_loop.py`. Each environment
@@ -526,14 +616,13 @@ name maps to a Python class that points to a MuJoCo XML scene file.
 Replace `--env_name` with whichever environment you want:
 
 ```bash
-# Kitchen pick-and-place scene (apple → plate), with stereo head cameras and base state stream
+# Cube pick-and-place scene, with stereo head cameras
 source .venv_teleop/bin/activate
 python gear_sonic/scripts/run_sim_loop.py \
-    --env_name kitchen_pnp_apple \
+    --env_name pnp_cube \
     --head_cam \
     --enable_image_publish \
-    --enable_offscreen \
-    --base_state_port 5558
+    --enable_offscreen
 ```
 
 All other terminals (WBC, PICO manager, recorder) are started exactly as described in

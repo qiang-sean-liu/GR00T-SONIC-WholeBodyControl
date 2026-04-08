@@ -349,7 +349,8 @@ def _stack_frames(frames: list) -> Dict[str, np.ndarray]:
     return stacked
 
 
-def save_episode(buf: _EpisodeBuffer, episode_dir: str) -> None:
+def save_episode(buf: _EpisodeBuffer, episode_dir: str,
+                  env_name: str = "", task: str = "") -> None:
     os.makedirs(episode_dir, exist_ok=True)
 
     # PICO stream
@@ -395,6 +396,8 @@ def save_episode(buf: _EpisodeBuffer, episode_dir: str) -> None:
         "sonic_keys": list(sonic_data.keys()),
         "cameras": list(cam_timestamps.keys()) if n_image_frames > 0 else [],
         "saved_at": datetime.now().isoformat(),
+        "env_name": env_name,
+        "task": task,
     }
     with open(os.path.join(episode_dir, "meta.json"), "w") as f:
         json.dump(meta, f, indent=2)
@@ -442,6 +445,16 @@ def main():
     parser.add_argument(
         "--no_images", action="store_true",
         help="Skip camera image recording (faster, smaller output)",
+    )
+    parser.add_argument(
+        "--env_name", default="",
+        help="MuJoCo scene name used for this recording (e.g. pnp_cube, kitchen_pnp_apple). "
+             "Saved to meta.json so downstream tools can auto-detect the correct scene.",
+    )
+    parser.add_argument(
+        "--task", default="",
+        help="Language task description for this recording (e.g. 'Pick up cube'). "
+             "Saved to meta.json and used as default by convert_sonic_to_lerobot.py.",
     )
     args = parser.parse_args()
 
@@ -548,7 +561,7 @@ def main():
                 else:
                     ts = datetime.now().strftime("%Y%m%d_%H%M%S")
                     episode_dir = os.path.join(args.output_dir, f"{ts}_ep{episode_idx:04d}")
-                    save_episode(buf, episode_dir)
+                    save_episode(buf, episode_dir, env_name=args.env_name, task=args.task)
                     recording = False
                     buf = None
 
@@ -580,7 +593,7 @@ def main():
             ts = datetime.now().strftime("%Y%m%d_%H%M%S")
             episode_dir = os.path.join(args.output_dir, f"{ts}_ep{episode_idx:04d}_partial")
             print(f"[Recorder] Saving partial episode ({len(buf)} frames)...")
-            save_episode(buf, episode_dir)
+            save_episode(buf, episode_dir, env_name=args.env_name, task=args.task)
     finally:
         stop_event.set()
         pose_sock.close()
