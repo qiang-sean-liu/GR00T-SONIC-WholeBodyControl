@@ -6,8 +6,8 @@ Reads episodes saved by record_sonic_teleop.py and writes a LeRobot dataset
 Joint assembly (43 DOF, matching decoupled_wbc modality layout):
   observation.state  = body_q_measured[0:22] ‖ left_hand_q_measured[7]
                        ‖ body_q_measured[22:29] ‖ right_hand_q_measured[7]
-  action             = body_q_target[0:22]   ‖ pico.left_hand_joints[7]
-                       ‖ body_q_target[22:29]  ‖ pico.right_hand_joints[7]
+  action             = q_target_cmd[0:22]    ‖ pico.left_hand_joints[7]
+                       ‖ q_target_cmd[22:29]   ‖ pico.right_hand_joints[7]
   observation.eef_state / action.eef  [14]
                      = vr_3pt_pos[0:3] ‖ vr_3pt_ori[0:4]   (L-wrist)
                        ‖ vr_3pt_pos[3:6] ‖ vr_3pt_ori[4:8]  (R-wrist)
@@ -343,7 +343,7 @@ def _convert_episode(
         return sonic[key] if key in sonic else np.tile(fallback, (len(sonic["body_q_measured"]), 1)).reshape(len(sonic["body_q_measured"]), -1)
 
     body_q_meas   = sonic["body_q_measured"]        # [T, 29]
-    body_q_tgt    = sonic["body_q_target"]          # [T, 29]
+    body_q_tgt    = sonic["q_target_cmd"]            # [T, 29]  full SONIC policy target (q_target_cmd = DEFAULT_ANGLES + raw_action * ACTION_SCALE)
     lh_meas       = sonic["left_hand_q_measured"]   # [T, 7]
     rh_meas       = sonic["right_hand_q_measured"]  # [T, 7]
     vr_pos        = sonic["vr_3point_position"]     # [T, 9]
