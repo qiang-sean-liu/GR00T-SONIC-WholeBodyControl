@@ -50,7 +50,9 @@ sonic.npz keys  (see output_interface.hpp):
   base_trans_target   [T, 3]   target base translation (heading-corrected)
   base_quat_target    [T, 4]   target base quaternion (heading-corrected)
   body_q_measured     [T, 29]  measured joint positions (MuJoCo order)
+  body_dq_measured    [T, 29]  measured joint velocities (MuJoCo order)
   base_quat_measured  [T, 4]   measured IMU quaternion
+  base_ang_vel_measured [T, 3] measured IMU angular velocity (body frame)
   left/right_hand_q_measured [T, 7]  measured hand joint positions
   vr_3point_position  [T, 9]   VR positions rotated into target body frame
   vr_3point_orientation [T, 12] VR orientations (passed through)

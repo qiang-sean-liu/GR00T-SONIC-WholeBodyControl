@@ -169,8 +169,28 @@ public:
         const std::array<double, 4>& init_ref_data_root_rot_array,
         DataBuffer<HeadingState>& heading_state_buffer,
         std::shared_ptr<const MotionSequence> current_motion,
-        int current_frame
+        int current_frame,
+        bool include_model_io,
+        const std::span<const double>& encoder_obs,
+        const std::span<const double>& token_state,
+        const std::span<const double>& decoder_obs,
+        const std::span<const double>& decoder_action_raw,
+        const std::span<const double>& q_target_cmd
     ) override {
+        (void)vr_3point_position;
+        (void)vr_3point_orientation;
+        (void)vr_3point_compliance;
+        (void)left_hand_joint;
+        (void)right_hand_joint;
+        (void)init_ref_data_root_rot_array;
+        (void)current_motion;
+        (void)current_frame;
+        (void)include_model_io;
+        (void)encoder_obs;
+        (void)token_state;
+        (void)decoder_obs;
+        (void)decoder_action_raw;
+        (void)q_target_cmd;
         if (!node_ || !rclcpp::ok()) {
             return;
         }

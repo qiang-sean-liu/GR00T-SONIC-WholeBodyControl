@@ -97,7 +97,7 @@ causes the wrong scene to be loaded for episode replay.
 ```bash
 cd gear_sonic_deploy
 source scripts/setup_env.sh
-bash deploy.sh sim --input-type zmq_manager
+bash deploy.sh sim --input-type zmq_manager --enable-model-io-recording
 ```
 
 **Terminal 3 — PICO Manager**:
@@ -188,6 +188,18 @@ conda run -n sonic_dc python gear_sonic/scripts/convert_sonic_to_lerobot.py \
     --output_dir ./lerobot_dataset \
     --append
 ```
+
+Use default auto (now prefers q_target_cmd when available):
+conda run -n sonic_dc python gear_sonic/scripts/convert_sonic_to_lerobot.py \
+  --input_dir ./recordings \
+  --output_dir ./lerobot_dataset_2.4 \
+  --fps 20
+Force q_target_cmd explicitly:
+conda run -n sonic_dc python gear_sonic/scripts/convert_sonic_to_lerobot.py \
+  --input_dir ./recordings \
+  --output_dir ./lerobot_dataset_2.4 \
+  --fps 20 \
+  --action_source q_target_cmd
 
 See [Converting to GR00T Training Format](#converting-to-groot-training-format) for the full
 field mapping, options table, and notes on backward compatibility with older recordings.
@@ -283,7 +295,9 @@ Each episode is saved as a separate subdirectory named by wall-clock time and se
 | Key | Shape | Content |
 |-----|-------|---------|
 | `body_q_measured` | `[T, 29]` | Current joint positions in MuJoCo order, with `default_angles` offsets added |
+| `body_dq_measured` | `[T, 29]` | Current joint velocities in MuJoCo order (from Unitree low-state `dq`) |
 | `base_quat_measured` | `[T, 4]` | Base orientation from IMU — quaternion wxyz |
+| `base_ang_vel_measured` | `[T, 3]` | Base angular velocity from IMU gyroscope — `[wx, wy, wz]` |
 | `base_trans_measured` | `[T, 3]` | Base translation; fixed sim default `[0, −1, 0.793]` (not from odometry) |
 | `left_hand_q_measured` | `[T, 7]` | Left Dex3 hand joint positions |
 | `right_hand_q_measured` | `[T, 7]` | Right Dex3 hand joint positions |
@@ -570,7 +584,83 @@ conda run -n sonic_dc python gear_sonic/scripts/playback_lerobot.py \
     --env_name pnp_cube \
     --output_video playback_ep0.mp4 \
     --no_viewer
+
+# Playback with policy
+cd /home/horizon/wrk/SONIC/GR00T-WholeBodyControl
+source .venv_teleop/bin/activate
+
+python gear_sonic/scripts/playback_lerobot.py \
+  --dataset_dir ./lerobot_dataset_2.2 \
+  --episode 0 \
+  --env_name pnp_cube \
+  --fps 20 \
+  --sonic_encoder gear_sonic_deploy/policy/release/model_encoder.onnx \
+  --sonic_decoder gear_sonic_deploy/policy/release/model_decoder.onnx \
+  --compare \
+  --output_video ./playback_policy_ep0.mp4 \
+  --camera overview
+
+# playback with policy and physics
+python gear_sonic/scripts/playback_lerobot.py \
+  --dataset_dir ./lerobot_dataset_2.2 \
+  --episode 0 \
+  --env_name pnp_cube \
+  --fps 20 \
+  --sonic_encoder gear_sonic_deploy/policy/release/model_encoder.onnx \
+  --sonic_decoder gear_sonic_deploy/policy/release/model_decoder.onnx \
+  --compare \
+  --physics \
+  --output_video ./playback_policy_ep0_physics.mp4 \
+  --camera overview
+
+# Playback using recorded encoder/decoder history inputs (no 10-frame reconstruction in replay):
+# - Encoder uses recorded SMPL-mode blocks from sonic.encoder_obs:
+#     smpl_joints_10frame_step1 / smpl_anchor_orientation_10frame_step1 /
+#     motion_joint_positions_wrists_10frame_step1
+# - Decoder uses recorded sonic.decoder_obs directly (his_* 10-frame inputs from recording).
+# - Decoder output is still recomputed by ONNX (not copied from recorded decoder_action_raw/q_target_cmd).
+# - Writes a per-frame model-I/O comparison report txt (default):
+#     <dataset_dir>/episode_<episode>_model_io_frame_compare.txt
+#   The same txt now includes:
+#     * decoder_action_raw replay vs sonic.decoder_action_raw recorded (full vectors, each frame)
+#     * q_target_cmd replay vs sonic.q_target_cmd recorded (full vectors + per-frame L2)
+python gear_sonic/scripts/playback_lerobot_recorded_smpl_blocks.py \
+  --dataset_dir ./lerobot_dataset_2.4 \
+  --episode 0 \
+  --env_name pnp_cube \
+  --fps 20 \
+  --sonic_encoder gear_sonic_deploy/policy/release/model_encoder.onnx \
+  --sonic_decoder gear_sonic_deploy/policy/release/model_decoder.onnx \
+  --compare \
+  --output_video ./playback_policy_ep0_recorded_blocks.mp4 \
+  --camera overview
+
+# Optional: set custom report path
+python gear_sonic/scripts/playback_lerobot_recorded_smpl_blocks.py \
+  --dataset_dir ./lerobot_dataset_2.4 \
+  --episode 0 \
+  --env_name pnp_cube \
+  --fps 20 \
+  --sonic_encoder gear_sonic_deploy/policy/release/model_encoder.onnx \
+  --sonic_decoder gear_sonic_deploy/policy/release/model_decoder.onnx \
+  --indicator_report_txt ./debug/ep0_model_io_compare.txt
 ```
+python gear_sonic/scripts/playback_lerobot_recorded_smpl_blocks.py \
+  --dataset_dir ./lerobot_dataset_2.4 \
+  --episode 0 \
+  --env_name pnp_cube \
+  --fps 20 \
+  --sonic_encoder gear_sonic_deploy/policy/release/model_encoder.onnx \
+  --sonic_decoder gear_sonic_deploy/policy/release/model_decoder.onnx \
+  --compare \
+  --force_frame0_recorded_state \
+  --force_recorded_prefix_frames 11 \
+  --output_video ./playback_policy_ep0_recorded_blocks.mp4 \
+  --camera head_camera
+
+playback action
+python gear_sonic/scripts/playback_lerobot_action.py   
+--dataset_dir ./lerobot_dataset_2.4   --episode 0   --env_name pnp_cube   --fps 20   --output_video ./playback_action_ep0.mp4   --camera overview 
 
 ### Options
 

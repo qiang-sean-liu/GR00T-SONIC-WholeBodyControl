@@ -242,12 +242,11 @@
             <site name="imu" size="0.01" pos="-0.03959 -0.00224 0.13792" />
             <!-- Head camera: matches d435_joint in URDF -->
             <!-- pos: xyz from d435_joint; euler: "0 (-pi/2+pitch) -pi/2", pitch=0.8308 rad from URDF rpy -->
-            <!-- fovy=40: RealSense D435i physical FOV is 69deg H x 42deg V at 1920x1080;
-                 at 640x480 capture the sensor crops to ~40deg vertical FOV. -->
-            <camera name="head_camera" pos="0.0576235 0.01753 0.41987" euler="0 -0.7400 -1.5708" fovy="40"/>
+            <!-- fovy=90: wide-angle setting for simulation. -->
+            <camera name="head_camera" pos="0.0576235 0.01753 0.41987" euler="0 -0.7400 -1.5708" fovy="90"/>
             <!-- Stereo pair: IPD=65 mm offset along robot Y (camera horizontal axis, -pi/2 yaw) -->
-            <camera name="head_camera_left"  pos="0.0576235  0.04953 0.41987" euler="0 -0.7400 -1.5708" fovy="40"/>
-            <camera name="head_camera_right" pos="0.0576235 -0.01447 0.41987" euler="0 -0.7400 -1.5708" fovy="40"/>
+            <camera name="head_camera_left"  pos="0.0576235  0.04953 0.41987" euler="0 -0.7400 -1.5708" fovy="90"/>
+            <camera name="head_camera_right" pos="0.0576235 -0.01447 0.41987" euler="0 -0.7400 -1.5708" fovy="90"/>
             <body name="left_shoulder_pitch_link" pos="0.0039563 0.10022 0.23778"
               quat="0.990264 0.139201 1.38722e-05 -9.86868e-05">
               <inertial pos="0 0.035892 -0.011628" quat="0.654152 0.0130458 -0.326267 0.68225"

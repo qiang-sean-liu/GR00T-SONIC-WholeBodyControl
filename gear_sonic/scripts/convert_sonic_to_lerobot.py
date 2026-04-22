@@ -67,7 +67,7 @@ import pyarrow.parquet as pq
 # ---------------------------------------------------------------------------
 
 _CHUNKS_SIZE = 1000      # episodes per parquet/video chunk (matches decoupled_wbc)
-_CODEBASE_VERSION = "v2.1"
+_CODEBASE_VERSION = "v2.2"
 _DEFAULT_BASE_HEIGHT = 0.74  # m  (G1 standing height)
 _DEFAULT_NAV_CMD = [0.0, 0.0, 0.0]
 
@@ -129,20 +129,42 @@ MODALITY_CONFIG = {
 
 def _build_parquet_schema(video_keys: list[str]) -> pa.Schema:
     fields = [
-        pa.field("observation.state",        pa.list_(pa.float64(), 43)),
-        pa.field("observation.eef_state",    pa.list_(pa.float64(), 14)),
-        pa.field("action",                   pa.list_(pa.float64(), 43)),
-        pa.field("action.eef",               pa.list_(pa.float64(), 14)),
-        pa.field("observation.img_state_delta", pa.float32()),
-        pa.field("teleop.navigate_command",  pa.list_(pa.float64(), 3)),
-        pa.field("teleop.base_height_command", pa.float64()),
-        pa.field("robot.base_pos",           pa.list_(pa.float64(), 3)),
-        pa.field("robot.base_quat",          pa.list_(pa.float64(), 4)),
-        pa.field("timestamp",                pa.float32()),
-        pa.field("frame_index",              pa.int64()),
-        pa.field("episode_index",            pa.int64()),
-        pa.field("index",                    pa.int64()),
-        pa.field("task_index",               pa.int64()),
+        pa.field("observation.state",              pa.list_(pa.float64(), 43)),
+        pa.field("observation.eef_state",          pa.list_(pa.float64(), 14)),
+        pa.field("action",                         pa.list_(pa.float64(), 43)),
+        pa.field("action.eef",                     pa.list_(pa.float64(), 14)),
+        pa.field("observation.img_state_delta",    pa.float32()),
+        # Active (combined) navigate command — source is mode-dependent (pelvis in POSE, joystick in PLANNER)
+        pa.field("teleop.navigate_command",        pa.list_(pa.float64(), 3)),
+        # Per-source navigate commands (joystick always present; pelvis is NaN when no foot trackers)
+        pa.field("teleop.navigate_cmd_joystick",   pa.list_(pa.float64(), 3)),
+        pa.field("teleop.navigate_cmd_pelvis",     pa.list_(pa.float64(), 3)),
+        # Base height commands (joystick = button-driven; pelvis = SMPL pelvis Z, NaN when unavailable)
+        pa.field("teleop.base_height_cmd_joystick", pa.float64()),
+        pa.field("teleop.base_height_cmd_pelvis",   pa.float64()),
+        pa.field("robot.base_pos",                 pa.list_(pa.float64(), 3)),
+        pa.field("robot.base_quat",                pa.list_(pa.float64(), 4)),
+        # Measured robot state history terms used by SONIC decoder
+        pa.field("robot.base_ang_vel",             pa.list_(pa.float64(), 3)),
+        pa.field("robot.body_dq",                  pa.list_(pa.float64(), 29)),
+        # Optional exact model I/O buffers from deploy (when enabled during recording)
+        pa.field("sonic.encoder_obs",              pa.list_(pa.float64(), 1762)),
+        pa.field("sonic.token_state",              pa.list_(pa.float64(), 64)),
+        pa.field("sonic.decoder_obs",              pa.list_(pa.float64(), 994)),
+        pa.field("sonic.decoder_action_raw",       pa.list_(pa.float64(), 29)),
+        pa.field("sonic.q_target_cmd",             pa.list_(pa.float64(), 29)),
+        # SMPL body data (most-recent buffered frame per tick; zeros when SMPL not active)
+        # pico.smpl_joints: 24 joints × 3 (absolute world-space XYZ, J=0 is pelvis)
+        pa.field("pico.smpl_joints",               pa.list_(pa.float32(), 72)),
+        # pico.smpl_pose:   21 joints × 3 (axis-angle per joint)
+        pa.field("pico.smpl_pose",                 pa.list_(pa.float32(), 63)),
+        # pico.body_root_quat: body root quaternion wxyz from SMPL fit
+        pa.field("pico.body_root_quat",            pa.list_(pa.float32(), 4)),
+        pa.field("timestamp",                      pa.float32()),
+        pa.field("frame_index",                    pa.int64()),
+        pa.field("episode_index",                  pa.int64()),
+        pa.field("index",                          pa.int64()),
+        pa.field("task_index",                     pa.int64()),
     ]
     return pa.schema(fields)
 
@@ -317,14 +339,26 @@ def _convert_episode(
     def pico_f(key: str, fallback: np.ndarray) -> np.ndarray:
         return pico[key] if key in pico else np.tile(fallback, (len(ts), 1)).reshape(len(ts), -1)
 
-    body_q_meas   = sonic["body_q_measured"]   # [T, 29]
-    body_q_tgt    = sonic["body_q_target"]      # [T, 29]
+    def sonic_f(key: str, fallback: np.ndarray) -> np.ndarray:
+        return sonic[key] if key in sonic else np.tile(fallback, (len(sonic["body_q_measured"]), 1)).reshape(len(sonic["body_q_measured"]), -1)
+
+    body_q_meas   = sonic["body_q_measured"]        # [T, 29]
+    body_q_tgt    = sonic["body_q_target"]          # [T, 29]
     lh_meas       = sonic["left_hand_q_measured"]   # [T, 7]
     rh_meas       = sonic["right_hand_q_measured"]  # [T, 7]
-    vr_pos        = sonic["vr_3point_position"]      # [T, 9]
-    vr_ori        = sonic["vr_3point_orientation"]   # [T, 12]
-    base_pos      = sonic["base_pos_sim"]            # [T, 3] XYZ world frame
-    base_quat     = sonic["base_quat_sim"]           # [T, 4] wxyz world frame
+    vr_pos        = sonic["vr_3point_position"]     # [T, 9]
+    vr_ori        = sonic["vr_3point_orientation"]  # [T, 12]
+    base_pos      = sonic_f("base_pos_sim",  np.zeros(3, dtype=np.float64))   # [T, 3] XYZ world frame
+    base_quat     = sonic_f("base_quat_sim", np.array([1., 0., 0., 0.], dtype=np.float64))  # [T, 4] wxyz
+    # Decoder-history state from g1_debug (fallback to zeros for older recordings)
+    base_ang_vel_meas = sonic_f("base_ang_vel_measured", np.zeros(3, dtype=np.float64))  # [T, 3]
+    body_dq_meas      = sonic_f("body_dq_measured", np.zeros(29, dtype=np.float64))       # [T, 29]
+    # Optional exact model I/O (when --enable-model-io-recording is used in deploy)
+    encoder_obs       = sonic_f("encoder_obs", np.zeros(1762, dtype=np.float64))           # [T, 1762]
+    token_state       = sonic_f("token_state", np.zeros(64, dtype=np.float64))             # [T, 64]
+    decoder_obs       = sonic_f("decoder_obs", np.zeros(994, dtype=np.float64))            # [T, 994]
+    decoder_action    = sonic_f("decoder_action_raw", np.zeros(29, dtype=np.float64))      # [T, 29]
+    q_target_cmd      = sonic_f("q_target_cmd", np.zeros(29, dtype=np.float64))            # [T, 29]
 
     # pico hand targets — shape [T, 7]
     lh_tgt = pico["left_hand_joints"]   # always present
@@ -333,13 +367,43 @@ def _convert_episode(
     # navigate_cmd — shape [T, 3]; zeros if not recorded
     nav_cmd = pico_f("navigate_cmd", np.array(_DEFAULT_NAV_CMD, dtype=np.float32))
 
-    # base_height — shape [T, 1]; default 0.74 if not recorded
+    # Per-source navigate commands (present in newer recordings only)
+    _zeros3 = np.zeros(3, dtype=np.float32)
+    _nans3  = np.full(3, np.nan, dtype=np.float32)
+    nav_cmd_joystick = pico_f("navigate_cmd_joystick", _zeros3)
+    nav_cmd_pelvis   = pico_f("navigate_cmd_pelvis",   _nans3)
+
+    # Base height — joystick source; shape [T]; default 0.74 if not recorded
     if "base_height_cmd_joystick" in pico:
-        bh = pico["base_height_cmd_joystick"].reshape(-1)
+        bh_joystick = pico["base_height_cmd_joystick"].reshape(-1)
     elif "base_height_command" in pico:
-        bh = pico["base_height_command"].reshape(-1)
+        bh_joystick = pico["base_height_command"].reshape(-1)
     else:
-        bh = np.full(len(ts), _DEFAULT_BASE_HEIGHT, dtype=np.float32)
+        bh_joystick = np.full(len(ts), _DEFAULT_BASE_HEIGHT, dtype=np.float32)
+
+    # Base height — pelvis source; NaN when foot trackers unavailable or field absent
+    if "base_height_cmd_pelvis" in pico:
+        bh_pelvis = pico["base_height_cmd_pelvis"].reshape(-1)
+    else:
+        bh_pelvis = np.full(len(ts), np.nan, dtype=np.float32)
+
+    # SMPL body data — most-recent buffered frame per tick (index -1 along the N axis)
+    # shape [T, N, 24, 3] → take last frame → [T, 72]
+    if "smpl_joints" in pico:
+        smpl_joints = pico["smpl_joints"][:, -1, :, :].reshape(len(ts), 72)
+    else:
+        smpl_joints = np.zeros((len(ts), 72), dtype=np.float32)
+
+    if "smpl_pose" in pico:
+        smpl_pose = pico["smpl_pose"][:, -1, :, :].reshape(len(ts), 63)
+    else:
+        smpl_pose = np.zeros((len(ts), 63), dtype=np.float32)
+
+    # body_quat_w — shape [T, N, 4] → most-recent frame → [T, 4]
+    if "body_quat_w" in pico:
+        body_root_quat = pico["body_quat_w"][:, -1, :].astype(np.float32)
+    else:
+        body_root_quat = np.tile([1.0, 0.0, 0.0, 0.0], (len(ts), 1)).astype(np.float32)
 
     # ------------------------------------------------------------------
     # Images
@@ -366,8 +430,13 @@ def _convert_episode(
     stat_accum: dict[str, list[np.ndarray]] = {
         k: [] for k in ["observation.state", "observation.eef_state",
                          "action", "action.eef",
-                         "teleop.navigate_command", "teleop.base_height_command",
-                         "robot.base_pos", "robot.base_quat"]
+                         "teleop.navigate_command",
+                         "teleop.navigate_cmd_joystick", "teleop.navigate_cmd_pelvis",
+                         "teleop.base_height_cmd_joystick", "teleop.base_height_cmd_pelvis",
+                         "robot.base_pos", "robot.base_quat", "robot.base_ang_vel", "robot.body_dq",
+                         "sonic.encoder_obs", "sonic.token_state", "sonic.decoder_obs",
+                         "sonic.decoder_action_raw", "sonic.q_target_cmd",
+                         "pico.smpl_joints", "pico.body_root_quat"]
     }
 
     for out_fi, si in enumerate(src_idx):
@@ -375,11 +444,25 @@ def _convert_episode(
         action = _assemble_state(body_q_tgt[si], lh_tgt[si].astype(np.float64), rh_tgt[si].astype(np.float64))
         eef = _assemble_eef(vr_pos[si], vr_ori[si])
         nav = nav_cmd[si].astype(np.float64)
-        height = float(bh[si])
+        nav_js = nav_cmd_joystick[si].astype(np.float64)
+        nav_pl = nav_cmd_pelvis[si].astype(np.float64)
+        bh_js = float(bh_joystick[si])
+        bh_pl = float(bh_pelvis[si])
         timestamp = float(ts[si] - t0)
 
         bp = base_pos[si].astype(np.float64)
         bq = base_quat[si].astype(np.float64)
+        bav = base_ang_vel_meas[si].astype(np.float64)
+        bdq = body_dq_meas[si].astype(np.float64)
+        eobs = encoder_obs[si].astype(np.float64)
+        tks = token_state[si].astype(np.float64)
+        dobs = decoder_obs[si].astype(np.float64)
+        draw = decoder_action[si].astype(np.float64)
+        qcmd = q_target_cmd[si].astype(np.float64)
+
+        sj  = smpl_joints[si].astype(np.float32)
+        sp  = smpl_pose[si].astype(np.float32)
+        brq = body_root_quat[si].astype(np.float32)
 
         rows["observation.state"].append(state.tolist())
         rows["observation.eef_state"].append(eef.tolist())
@@ -387,9 +470,22 @@ def _convert_episode(
         rows["action.eef"].append(eef.tolist())
         rows["observation.img_state_delta"].append(np.float32(0.0))
         rows["teleop.navigate_command"].append(nav.tolist())
-        rows["teleop.base_height_command"].append(height)
+        rows["teleop.navigate_cmd_joystick"].append(nav_js.tolist())
+        rows["teleop.navigate_cmd_pelvis"].append(nav_pl.tolist())
+        rows["teleop.base_height_cmd_joystick"].append(bh_js)
+        rows["teleop.base_height_cmd_pelvis"].append(bh_pl)
         rows["robot.base_pos"].append(bp.tolist())
         rows["robot.base_quat"].append(bq.tolist())
+        rows["robot.base_ang_vel"].append(bav.tolist())
+        rows["robot.body_dq"].append(bdq.tolist())
+        rows["sonic.encoder_obs"].append(eobs.tolist())
+        rows["sonic.token_state"].append(tks.tolist())
+        rows["sonic.decoder_obs"].append(dobs.tolist())
+        rows["sonic.decoder_action_raw"].append(draw.tolist())
+        rows["sonic.q_target_cmd"].append(qcmd.tolist())
+        rows["pico.smpl_joints"].append(sj.tolist())
+        rows["pico.smpl_pose"].append(sp.tolist())
+        rows["pico.body_root_quat"].append(brq.tolist())
         rows["timestamp"].append(np.float32(timestamp))
         rows["frame_index"].append(out_fi)
         rows["episode_index"].append(episode_index)
@@ -401,9 +497,21 @@ def _convert_episode(
         stat_accum["action"].append(action)
         stat_accum["action.eef"].append(eef)
         stat_accum["teleop.navigate_command"].append(nav)
-        stat_accum["teleop.base_height_command"].append(np.array([height]))
+        stat_accum["teleop.navigate_cmd_joystick"].append(nav_js)
+        stat_accum["teleop.navigate_cmd_pelvis"].append(nav_pl)
+        stat_accum["teleop.base_height_cmd_joystick"].append(np.array([bh_js]))
+        stat_accum["teleop.base_height_cmd_pelvis"].append(np.array([bh_pl]))
         stat_accum["robot.base_pos"].append(bp)
         stat_accum["robot.base_quat"].append(bq)
+        stat_accum["robot.base_ang_vel"].append(bav)
+        stat_accum["robot.body_dq"].append(bdq)
+        stat_accum["sonic.encoder_obs"].append(eobs)
+        stat_accum["sonic.token_state"].append(tks)
+        stat_accum["sonic.decoder_obs"].append(dobs)
+        stat_accum["sonic.decoder_action_raw"].append(draw)
+        stat_accum["sonic.q_target_cmd"].append(qcmd)
+        stat_accum["pico.smpl_joints"].append(sj)
+        stat_accum["pico.body_root_quat"].append(brq)
 
         # Images
         if encoders:
@@ -539,14 +647,34 @@ def main() -> None:
             "action":                    {"dtype": "float64", "shape": [43], "names": None},
             "action.eef":                {"dtype": "float64", "shape": [14], "names": None},
             "observation.img_state_delta": {"dtype": "float32", "shape": [1], "names": None},
-            "teleop.navigate_command":   {"dtype": "float64", "shape": [3],
-                                          "names": ["lin_vel_x", "lin_vel_y", "ang_vel_z"]},
-            "teleop.base_height_command":{"dtype": "float64", "shape": [1],
-                                          "names": "base_height_command"},
+            "teleop.navigate_command":         {"dtype": "float64", "shape": [3],
+                                               "names": ["lin_vel_x", "lin_vel_y", "ang_vel_z"]},
+            "teleop.navigate_cmd_joystick":    {"dtype": "float64", "shape": [3],
+                                               "names": ["lin_vel_x", "lin_vel_y", "ang_vel_z"]},
+            "teleop.navigate_cmd_pelvis":      {"dtype": "float64", "shape": [3],
+                                               "names": ["lin_vel_x", "lin_vel_y", "ang_vel_z"]},
+            "teleop.base_height_cmd_joystick": {"dtype": "float64", "shape": [1],
+                                               "names": ["base_height_command"]},
+            "teleop.base_height_cmd_pelvis":   {"dtype": "float64", "shape": [1],
+                                               "names": ["base_height_command"]},
+            "pico.smpl_joints":                {"dtype": "float32", "shape": [72],
+                                               "names": None},
+            "pico.smpl_pose":                  {"dtype": "float32", "shape": [63],
+                                               "names": None},
+            "pico.body_root_quat":             {"dtype": "float32", "shape": [4],
+                                               "names": ["w", "x", "y", "z"]},
             "robot.base_pos":            {"dtype": "float64", "shape": [3],
                                           "names": ["x", "y", "z"]},
             "robot.base_quat":           {"dtype": "float64", "shape": [4],
                                           "names": ["w", "x", "y", "z"]},
+            "robot.base_ang_vel":        {"dtype": "float64", "shape": [3],
+                                          "names": ["wx", "wy", "wz"]},
+            "robot.body_dq":             {"dtype": "float64", "shape": [29], "names": None},
+            "sonic.encoder_obs":         {"dtype": "float64", "shape": [1762], "names": None},
+            "sonic.token_state":         {"dtype": "float64", "shape": [64], "names": None},
+            "sonic.decoder_obs":         {"dtype": "float64", "shape": [994], "names": None},
+            "sonic.decoder_action_raw":  {"dtype": "float64", "shape": [29], "names": None},
+            "sonic.q_target_cmd":        {"dtype": "float64", "shape": [29], "names": None},
             "timestamp":   {"dtype": "float32", "shape": [1], "names": None},
             "frame_index": {"dtype": "int64",   "shape": [1], "names": None},
             "episode_index":{"dtype":"int64",   "shape": [1], "names": None},

@@ -1356,6 +1356,11 @@ class PoseStreamer:
         # Data collection button state tracking (edge-triggered)
         self.toggle_data_collection_last = False
         self.toggle_data_abort_last = False
+        # Stretch one-frame button edges across multiple outgoing pose packets
+        # so downstream recorders don't miss brief pulses under load.
+        self.toggle_pulse_frames = 4
+        self.toggle_data_collection_pulse_remaining = 0
+        self.toggle_data_abort_pulse_remaining = 0
 
         self.buffer_cleared = (
             True  # Start with buffer cleared - wait for full buffer before first send
@@ -1413,6 +1418,10 @@ class PoseStreamer:
         toggle_data_abort = toggle_data_abort_tmp and not self.toggle_data_abort_last
         self.toggle_data_collection_last = toggle_data_collection_tmp
         self.toggle_data_abort_last = toggle_data_abort_tmp
+        if toggle_data_collection:
+            self.toggle_data_collection_pulse_remaining = self.toggle_pulse_frames
+        if toggle_data_abort:
+            self.toggle_data_abort_pulse_remaining = self.toggle_pulse_frames
 
         left_hand_joints, right_hand_joints = compute_hand_joints_from_inputs(
             self.left_hand_ik_solver,
@@ -1596,6 +1605,8 @@ class PoseStreamer:
 
         # Only send if buffer is full and we're not waiting for fresh data
         if buffer_is_full and not self.buffer_cleared:
+            toggle_data_collection_out = self.toggle_data_collection_pulse_remaining > 0
+            toggle_data_abort_out = self.toggle_data_abort_pulse_remaining > 0
             numpy_data = {
                 "smpl_pose": np.stack((self.frame_buffer["smpl_pose"]), axis=0),
                 "smpl_joints": np.stack((self.frame_buffer["smpl_joints"]), axis=0),
@@ -1619,8 +1630,11 @@ class PoseStreamer:
                 ),
                 "left_hand_joints": left_hand_joints.reshape(-1).astype(np.float32),
                 "right_hand_joints": right_hand_joints.reshape(-1).astype(np.float32),
-                "toggle_data_collection": np.array([toggle_data_collection], dtype=bool),
-                "toggle_data_abort": np.array([toggle_data_abort], dtype=bool),
+                "toggle_data_collection": np.array([toggle_data_collection_out], dtype=bool),
+                "toggle_data_abort": np.array([toggle_data_abort_out], dtype=bool),
+                # Raw button states for recorder-side fallback combo detection.
+                "a_button": np.array([a_pressed], dtype=bool),
+                "b_button": np.array([b_pressed], dtype=bool),
                 "heading_increment": np.array(
                     [self.yaw_accumulator.yaw_angle_change()], dtype=np.float32
                 ),
@@ -1633,6 +1647,10 @@ class PoseStreamer:
 
             packed_message = pack_pose_message(numpy_data, topic="pose")
             self.socket.send(packed_message)
+            if self.toggle_data_collection_pulse_remaining > 0:
+                self.toggle_data_collection_pulse_remaining -= 1
+            if self.toggle_data_abort_pulse_remaining > 0:
+                self.toggle_data_abort_pulse_remaining -= 1
 
             if self.record_dir:
                 out_path = os.path.join(self.record_dir, f"pose_{self.record_idx:06d}.npz")

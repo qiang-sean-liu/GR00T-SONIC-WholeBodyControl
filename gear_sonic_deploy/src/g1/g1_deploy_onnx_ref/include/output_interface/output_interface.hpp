@@ -40,6 +40,7 @@
 #include <memory>
 #include <array>
 #include <vector>
+#include <span>
 #include <msgpack.hpp>
 
 #include "../state_logger.hpp"
@@ -90,7 +91,13 @@ public:
         const std::array<double, 4>& init_ref_data_root_rot_array,
         DataBuffer<HeadingState>& heading_state_buffer,
         std::shared_ptr<const MotionSequence> current_motion,
-        int current_frame
+        int current_frame,
+        bool include_model_io,
+        const std::span<const double>& encoder_obs,
+        const std::span<const double>& token_state,
+        const std::span<const double>& decoder_obs,
+        const std::span<const double>& decoder_action_raw,
+        const std::span<const double>& q_target_cmd
     ) = 0;
 
     /// @return The OutputType tag for this concrete implementation.
@@ -114,6 +121,8 @@ protected:
      *   base_trans_measured    |  3   | Measured base translation (fixed default).
      *   base_quat_measured     |  4   | Measured base quaternion from IMU.
      *   body_q_measured        | 29   | Measured joint positions (MuJoCo order + default offsets).
+     *   body_dq_measured       | 29   | Measured joint velocities (MuJoCo order).
+     *   base_ang_vel_measured  |  3   | Measured base angular velocity from IMU (wx, wy, wz).
      *   left_hand_q_measured   |  7   | Left-hand Dex3 joint positions.
      *   right_hand_q_measured  |  7   | Right-hand Dex3 joint positions.
      *   vr_3point_position     |  9   | VR positions rotated into target body frame.
@@ -132,7 +141,13 @@ protected:
         const std::array<double, 4>& init_ref_data_root_rot_array,
         DataBuffer<HeadingState>& heading_state_buffer,
         std::shared_ptr<const MotionSequence> current_motion,
-        int current_frame
+        int current_frame,
+        bool include_model_io,
+        const std::span<const double>& encoder_obs,
+        const std::span<const double>& token_state,
+        const std::span<const double>& decoder_obs,
+        const std::span<const double>& decoder_action_raw,
+        const std::span<const double>& q_target_cmd
     )
     {
         // Static key strings (avoid repeated allocations)
@@ -142,11 +157,18 @@ protected:
         static const std::string kBaseTransMeasured = "base_trans_measured";
         static const std::string kBaseQuatMeasured = "base_quat_measured";
         static const std::string kBodyQMeasured = "body_q_measured";
+        static const std::string kBodyDQMeasured = "body_dq_measured";
+        static const std::string kBaseAngVelMeasured = "base_ang_vel_measured";
         static const std::string kLeftHandQMeasured = "left_hand_q_measured";
         static const std::string kRightHandQMeasured = "right_hand_q_measured";
         static const std::string kVr3pointPosition = "vr_3point_position";
         static const std::string kVr3pointOrientation = "vr_3point_orientation";
         static const std::string kVr3pointCompliance = "vr_3point_compliance";
+        static const std::string kEncoderObs = "encoder_obs";
+        static const std::string kTokenState = "token_state";
+        static const std::string kDecoderObs = "decoder_obs";
+        static const std::string kDecoderActionRaw = "decoder_action_raw";
+        static const std::string kQTargetCmd = "q_target_cmd";
 
         std::vector<StateLogger::Entry> entries = state_logger_.GetLatest(1);
         const StateLogger::Entry& state = entries[0];
@@ -171,11 +193,14 @@ protected:
         // ---- Populate measured values from robot state (always available) ----
         // Remap from IsaacLab joint ordering to MuJoCo ordering and add default offsets.
         std::array<double, 29> body_q_measured;
+        std::array<double, 29> body_dq_measured;
         for (int i = 0; i < 29; i++) {
           body_q_measured[i] = state.body_q[isaaclab_to_mujoco[i]] + default_angles[i];
+          body_dq_measured[i] = state.body_dq[isaaclab_to_mujoco[i]];
         }
         std::array<double, 3> base_trans_measured = {0.0, -1.0, 0.793};  // Fixed default position
         std::array<double, 4> base_quat_measured = state.base_quat;       // From IMU
+        std::array<double, 3> base_ang_vel_measured = state.base_ang_vel; // IMU gyroscope
 
         // Populate joint targets if available
         if (has_joint_data) {
@@ -253,6 +278,8 @@ protected:
         output_data_map_[kBaseTransMeasured].assign(base_trans_measured.begin(), base_trans_measured.end());
         output_data_map_[kBaseQuatMeasured].assign(base_quat_measured.begin(), base_quat_measured.end());
         output_data_map_[kBodyQMeasured].assign(body_q_measured.begin(), body_q_measured.end());
+        output_data_map_[kBodyDQMeasured].assign(body_dq_measured.begin(), body_dq_measured.end());
+        output_data_map_[kBaseAngVelMeasured].assign(base_ang_vel_measured.begin(), base_ang_vel_measured.end());
         output_data_map_[kLeftHandQMeasured].assign(left_hand_joint.begin(), left_hand_joint.end());
         output_data_map_[kRightHandQMeasured].assign(right_hand_joint.begin(), right_hand_joint.end());
 
@@ -260,6 +287,13 @@ protected:
         output_data_map_[kVr3pointPosition].assign(vr_3point_position_sent.begin(), vr_3point_position_sent.end());
         output_data_map_[kVr3pointOrientation].assign(vr_3point_orientation.begin(), vr_3point_orientation.end());
         output_data_map_[kVr3pointCompliance].assign(vr_3point_compliance.begin(), vr_3point_compliance.end());
+        if (include_model_io) {
+          output_data_map_[kEncoderObs].assign(encoder_obs.begin(), encoder_obs.end());
+          output_data_map_[kTokenState].assign(token_state.begin(), token_state.end());
+          output_data_map_[kDecoderObs].assign(decoder_obs.begin(), decoder_obs.end());
+          output_data_map_[kDecoderActionRaw].assign(decoder_action_raw.begin(), decoder_action_raw.end());
+          output_data_map_[kQTargetCmd].assign(q_target_cmd.begin(), q_target_cmd.end());
+        }
 
         output_data_sbuf_.clear();
         msgpack::pack(output_data_sbuf_, output_data_map_);

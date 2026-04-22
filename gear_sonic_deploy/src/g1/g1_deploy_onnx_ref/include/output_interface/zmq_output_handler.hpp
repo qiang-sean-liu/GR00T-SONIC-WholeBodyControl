@@ -84,7 +84,13 @@ public:
         const std::array<double, 4>& init_ref_data_root_rot_array,
         DataBuffer<HeadingState>& heading_state_buffer,
         std::shared_ptr<const MotionSequence> current_motion,
-        int current_frame
+        int current_frame,
+        bool include_model_io,
+        const std::span<const double>& encoder_obs,
+        const std::span<const double>& token_state,
+        const std::span<const double>& decoder_obs,
+        const std::span<const double>& decoder_action_raw,
+        const std::span<const double>& q_target_cmd
     ) override
     {
 
@@ -97,7 +103,13 @@ public:
             init_ref_data_root_rot_array,
             heading_state_buffer,
             current_motion,
-            current_frame
+            current_frame,
+            include_model_io,
+            encoder_obs,
+            token_state,
+            decoder_obs,
+            decoder_action_raw,
+            q_target_cmd
         );
 
         // Non blocking send - should have predictable timing in the order of microseconds

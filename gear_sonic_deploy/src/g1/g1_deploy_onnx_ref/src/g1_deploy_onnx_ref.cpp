@@ -269,6 +269,11 @@ class G1Deploy {
     std::array<double, G1_NUM_MOTOR> last_action;
     std::array<double, 7> last_left_hand_action;
     std::array<double, 7> last_right_hand_action;
+    bool enable_model_io_recording_ = false;
+    std::vector<double> latest_decoder_obs_;
+    std::vector<double> latest_encoder_obs_;
+    std::vector<double> latest_decoder_action_raw_;
+    std::vector<double> latest_q_target_cmd_;
     
     // =========================================================================
     // Logging / recording streams
@@ -2007,6 +2012,7 @@ class G1Deploy {
       bool zmq_verbose = false,
       int zmq_out_port = 5557,
       std::string zmq_out_topic = "g1_debug",
+      bool enable_model_io_recording = false,
       bool enable_motion_recording = false,
       std::array<double, 3> initial_compliance = {0.05, 0.05, 0.0},
       double initial_max_close_ratio = 1.0)
@@ -2024,6 +2030,7 @@ class G1Deploy {
         last_action {0.0},
         last_left_hand_action {0.0},
         last_right_hand_action {0.0},
+        enable_model_io_recording_(enable_model_io_recording),
         enable_motion_recording_(enable_motion_recording),
         initial_vr_3point_compliance_(initial_compliance),
         initial_max_close_ratio_(initial_max_close_ratio),
@@ -2422,6 +2429,10 @@ class G1Deploy {
       } else {
         std::cout << "Total output interfaces initialized: " << output_interfaces_.size() << std::endl;
       }
+      if (enable_model_io_recording_) {
+        std::cout << "[INFO] Model IO recording enabled in output payload: "
+                  << "encoder_obs, token_state, decoder_obs, decoder_action_raw, q_target_cmd" << std::endl;
+      }
 
       // create threads
       input_thread_ptr_ = CreateRecurrentThreadEx("Input", UT_CPU_ID_NONE, input_dt_ * 1e6, &G1Deploy::Input, this);
@@ -2803,6 +2814,9 @@ class G1Deploy {
      * (hardware order) using `g1_action_scale` and `default_angles`.
      */
     bool CreatePolicyCommand() {
+      if (enable_model_io_recording_) {
+        latest_decoder_obs_ = obs_buffer_;
+      }
       // Convert double observation to float and populate policy's internal input buffer
       auto& obs_buffer_float = policy_engine_->GetInputBuffer();
       for (size_t i = 0; i < obs_buffer_.size(); i++) { 
@@ -2828,6 +2842,14 @@ class G1Deploy {
         motor_command_tmp.kp.at(i) = kps[i];
         motor_command_tmp.kd.at(i) = kds[i];
         motor_command_tmp.dq_target.at(i) = 0.0;
+      }
+      if (enable_model_io_recording_) {
+        latest_decoder_action_raw_.resize(G1_NUM_MOTOR);
+        latest_q_target_cmd_.resize(G1_NUM_MOTOR);
+        for (int i = 0; i < G1_NUM_MOTOR; ++i) {
+          latest_decoder_action_raw_[i] = static_cast<double>(floatarr[i]);
+          latest_q_target_cmd_[i] = static_cast<double>(motor_command_tmp.q_target.at(i));
+        }
       }
       motor_command_buffer_.SetData(motor_command_tmp);
       return true;
@@ -3498,6 +3520,9 @@ class G1Deploy {
               std::cerr << "[WARNING] Failed to log token state to state logger" << std::endl;
             }
           }
+          if (enable_model_io_recording_) {
+            latest_encoder_obs_ = encoder_obs_buffer_;
+          }
 
           auto obs_end_time = std::chrono::steady_clock::now();
 
@@ -3530,7 +3555,13 @@ class G1Deploy {
               output_interface->publish(
                 vr_3point_position_buffer_, vr_3point_orientation_buffer_, vr_3point_compliance_buffer_,
                 left_hand_joint_buffer_, right_hand_joint_buffer_, init_ref_data_root_rot_array_,
-                heading_state_buffer_, current_motion_copy, current_frame_copy
+                heading_state_buffer_, current_motion_copy, current_frame_copy,
+                enable_model_io_recording_,
+                std::span<const double>(latest_encoder_obs_),
+                std::span<const double>(token_state_data_),
+                std::span<const double>(latest_decoder_obs_),
+                std::span<const double>(latest_decoder_action_raw_),
+                std::span<const double>(latest_q_target_cmd_)
               );
             }
           }
@@ -3689,6 +3720,7 @@ int main(int argc, char const* argv[]) {
     std::cout << "  --zmq-out-topic <topic>: ZMQ topic/prefix for output (default: g1_debug)" << std::endl;
     std::cout << "  --logs-dir <path>: optional logs output base directory (default: logs/<timestamp>/)" << std::endl;
     std::cout << "  --enable-csv-logs: enable writing CSV logs (default: OFF)" << std::endl;
+    std::cout << "  --enable-model-io-recording: include exact model I/O in g1_debug output (default: OFF)" << std::endl;
     std::cout << "  --enable-motion-recording: enable motion recording for ZMQ/planner (default: OFF)" << std::endl;
     std::cout << "  --set-compliance <value>: set initial VR 3-point compliance (0.01=rigid, 0.5=compliant; default: [0.5, 0.5, 0.0])" << std::endl;
     std::cout << "                                 Can specify 1 value (both hands) or 3 values (left_wrist,right_wrist,head)" << std::endl;
@@ -3735,6 +3767,7 @@ int main(int argc, char const* argv[]) {
   bool zmq_conflate = false;  // default off; enable with --zmq-conflate
   bool zmq_verbose = false;
   bool enableMotionRecording = false;  // default off; enable with --enable-motion-recording
+  bool enableModelIoRecording = false;  // default off; enable with --enable-model-io-recording
   int zmq_out_port = 5557;
   std::string zmq_out_topic = "g1_debug";
   std::array<double, 3> initial_compliance = {0.5, 0.5, 0.0}; // initial compliance is 0.5 for both hands (keyboard controllable)
@@ -3916,6 +3949,9 @@ int main(int argc, char const* argv[]) {
     } else if (std::string(argv[i]) == "--enable-motion-recording") {
       enableMotionRecording = true;
       std::cout << "[INFO] Motion recording enabled" << std::endl;
+    } else if (std::string(argv[i]) == "--enable-model-io-recording") {
+      enableModelIoRecording = true;
+      std::cout << "[INFO] Model IO recording enabled" << std::endl;
     } else if (std::string(argv[i]) == "--set-compliance") {
       if (i + 1 < argc) {
         // Parse compliance values (can be 1 or 3 values)
@@ -3998,6 +4034,7 @@ int main(int argc, char const* argv[]) {
     zmq_verbose,
     zmq_out_port,
     zmq_out_topic,
+    enableModelIoRecording,
     enableMotionRecording,
     initial_compliance,
     initial_max_close_ratio

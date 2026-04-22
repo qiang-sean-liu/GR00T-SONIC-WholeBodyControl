@@ -239,6 +239,7 @@
             <site name="imu_in_torso" size="0.01" pos="-0.03959 -0.00224 0.14792" />
             <!-- Head camera: matches d435_joint in URDF -->
             <!-- pos: xyz from d435_joint; euler: "0 (-pi/2+pitch) -pi/2", pitch=0.8308 rad from URDF rpy -->
+            <!-- fovy=90: wide-angle setting for simulation. -->
             <camera name="head_camera" pos="0.0576235 0.01753 0.41987" euler="0 -0.7400 -1.5708" fovy="90"/>
             <!-- Stereo pair: IPD=65 mm offset along robot Y (camera horizontal axis, -pi/2 yaw) -->
             <camera name="head_camera_left"  pos="0.0576235  0.04953 0.41987" euler="0 -0.7400 -1.5708" fovy="90"/>

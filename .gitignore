@@ -195,3 +195,9 @@ teleop_vids/
 
 # pem files
 *.pem
+
+# recorded files
+*.mp4
+lerobot_dataset_*
+recordings
+debug*
