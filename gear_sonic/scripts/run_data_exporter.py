@@ -49,6 +49,121 @@ from gear_sonic.utils.data_collection.zmq_state_subscriber import (
     poll_robot_config_zmq,
 )
 
+_DEFAULT_BASE_POS = np.array([0.0, 0.0, 0.8], dtype=np.float64)
+_DEFAULT_BASE_QUAT = np.array([1.0, 0.0, 0.0, 0.0], dtype=np.float64)
+_BASE_POS_SOURCE = None
+_BASE_QUAT_SOURCE = None
+
+
+def _set_base_pos_source_once(source: str) -> None:
+    global _BASE_POS_SOURCE
+    if _BASE_POS_SOURCE != source:
+        _BASE_POS_SOURCE = source
+        print(f"[BasePose] base_pos source: {source}")
+
+
+def _set_base_quat_source_once(source: str) -> None:
+    global _BASE_QUAT_SOURCE
+    if _BASE_QUAT_SOURCE != source:
+        _BASE_QUAT_SOURCE = source
+        print(f"[BasePose] base_quat source: {source}")
+
+
+def _extract_base_pos(proprio: dict) -> np.ndarray:
+    if "base_pos_sim" in proprio:
+        arr = np.asarray(proprio["base_pos_sim"], dtype=np.float64).reshape(-1)
+        if arr.size >= 3:
+            _set_base_pos_source_once("base_pos_sim")
+            return arr[:3]
+
+    if "base_pos" in proprio:
+        arr = np.asarray(proprio["base_pos"], dtype=np.float64).reshape(-1)
+        if arr.size >= 3:
+            _set_base_pos_source_once("base_pos")
+            return arr[:3]
+
+    if "base_trans_target" in proprio:
+        arr = np.asarray(proprio["base_trans_target"], dtype=np.float64).reshape(-1)
+        if arr.size >= 3:
+            _set_base_pos_source_once("base_trans_target")
+            return arr[:3]
+
+    if "base_trans_measured" in proprio:
+        arr = np.asarray(proprio["base_trans_measured"], dtype=np.float64).reshape(-1)
+        if arr.size >= 3:
+            _set_base_pos_source_once("base_trans_measured")
+            return arr[:3]
+
+    if "floating_base_pose" in proprio:
+        arr = np.asarray(proprio["floating_base_pose"], dtype=np.float64).reshape(-1)
+        if arr.size >= 3:
+            _set_base_pos_source_once("floating_base_pose[:3]")
+            return arr[:3]
+
+    if "base_pose" in proprio:
+        arr = np.asarray(proprio["base_pose"], dtype=np.float64).reshape(-1)
+        if arr.size >= 3:
+            _set_base_pos_source_once("base_pose[:3]")
+            return arr[:3]
+
+    odo_state = proprio.get("odo_state")
+    if isinstance(odo_state, dict) and "position" in odo_state:
+        arr = np.asarray(odo_state["position"], dtype=np.float64).reshape(-1)
+        if arr.size >= 3:
+            _set_base_pos_source_once("odo_state.position")
+            return arr[:3]
+
+    _set_base_pos_source_once("default_[0,0,0.8]")
+    return _DEFAULT_BASE_POS.copy()
+
+
+def _extract_base_quat(proprio: dict) -> np.ndarray:
+    if "base_quat_sim" in proprio:
+        arr = np.asarray(proprio["base_quat_sim"], dtype=np.float64).reshape(-1)
+        if arr.size >= 4:
+            _set_base_quat_source_once("base_quat_sim")
+            return arr[:4]
+
+    if "base_quat" in proprio:
+        arr = np.asarray(proprio["base_quat"], dtype=np.float64).reshape(-1)
+        if arr.size >= 4:
+            _set_base_quat_source_once("base_quat")
+            return arr[:4]
+
+    if "base_quat_measured" in proprio:
+        arr = np.asarray(proprio["base_quat_measured"], dtype=np.float64).reshape(-1)
+        if arr.size >= 4:
+            _set_base_quat_source_once("base_quat_measured")
+            return arr[:4]
+
+    if "base_quat_target" in proprio:
+        arr = np.asarray(proprio["base_quat_target"], dtype=np.float64).reshape(-1)
+        if arr.size >= 4:
+            _set_base_quat_source_once("base_quat_target")
+            return arr[:4]
+
+    if "floating_base_pose" in proprio:
+        arr = np.asarray(proprio["floating_base_pose"], dtype=np.float64).reshape(-1)
+        if arr.size >= 7:
+            _set_base_quat_source_once("floating_base_pose[3:7]")
+            return arr[3:7]
+
+    if "base_pose" in proprio:
+        arr = np.asarray(proprio["base_pose"], dtype=np.float64).reshape(-1)
+        if arr.size >= 7:
+            _set_base_quat_source_once("base_pose[3:7]")
+            return arr[3:7]
+
+    odo_state = proprio.get("odo_state")
+    if isinstance(odo_state, dict) and "orientation" in odo_state:
+        arr = np.asarray(odo_state["orientation"], dtype=np.float64).reshape(-1)
+        if arr.size >= 4:
+            _set_base_quat_source_once("odo_state.orientation")
+            return arr[:4]
+
+    _set_base_quat_source_once("default_identity")
+    return _DEFAULT_BASE_QUAT.copy()
+
 # ---------------------------------------------------------------------------
 # Config
 # ---------------------------------------------------------------------------
@@ -92,6 +207,12 @@ class SonicDataExporterConfig:
 
     state_zmq_port: int = 5557
     """ZMQ port for robot state (same socket as robot_config topic)."""
+
+    base_state_zmq_host: str = "localhost"
+    """ZMQ host for MuJoCo ground-truth base_state topic."""
+
+    base_state_zmq_port: int = 5558
+    """ZMQ port for MuJoCo ground-truth base_state topic (0 disables)."""
 
     # Robot config
     robot_config_timeout: float = 0
@@ -164,6 +285,28 @@ def unpack_pose_message(packed_data: bytes, topic: str = "pose") -> dict:
     return result
 
 
+def unpack_base_state_message(raw: bytes, topic: str = "base_state") -> dict | None:
+    topic_bytes = topic.encode("utf-8")
+    if not raw.startswith(topic_bytes):
+        return None
+
+    payload = raw[len(topic_bytes) :]
+    try:
+        data = json.loads(payload.decode("utf-8"))
+    except Exception:
+        try:
+            import msgpack
+
+            data = msgpack.unpackb(payload)
+        except Exception:
+            return None
+
+    return {
+        (k.decode() if isinstance(k, bytes) else k): np.asarray(v, dtype=np.float64)
+        for k, v in data.items()
+    }
+
+
 class TimingThresholdMonitor:
     def __init__(self, max_failures=3, reset_timeout_sec=5, time_delta=0.2, raise_exception=False):
         self.max_failures = max_failures
@@ -227,6 +370,8 @@ class GrootDataCollector:
         sonic_data_zmq_port: int = 5556,
         state_zmq_host: str = "localhost",
         state_zmq_port: int = 5557,
+        base_state_zmq_host: str = "localhost",
+        base_state_zmq_port: int = 5558,
     ):
         self.text_to_speech = text_to_speech
         self.frequency = frequency
@@ -244,6 +389,7 @@ class GrootDataCollector:
         self.latest_proprio_msg = None
         self.latest_sonic_msg = None
         self.latest_planner_msg = None
+        self.latest_base_state_msg = None
 
         self.current_stream_mode = 0
 
@@ -273,6 +419,27 @@ class GrootDataCollector:
         except Exception as e:
             print(f"[Sonic] Warning: Failed to initialize ZMQ subscriber: {e}")
             self._sonic_zmq_socket = None
+
+        self._base_state_zmq_ctx = None
+        self._base_state_zmq_socket = None
+        if base_state_zmq_port > 0:
+            try:
+                self._base_state_zmq_ctx = zmq.Context()
+                self._base_state_zmq_socket = self._base_state_zmq_ctx.socket(zmq.SUB)
+                self._base_state_zmq_socket.connect(
+                    f"tcp://{base_state_zmq_host}:{base_state_zmq_port}"
+                )
+                self._base_state_zmq_socket.setsockopt(zmq.RCVTIMEO, 100)
+                self._base_state_zmq_socket.setsockopt(zmq.CONFLATE, 1)
+                self._base_state_zmq_socket.setsockopt(zmq.RCVHWM, 5)
+                self._base_state_zmq_socket.setsockopt_string(zmq.SUBSCRIBE, "base_state")
+                time.sleep(0.2)
+                print(
+                    f"[BaseState] Connected to ZMQ at {base_state_zmq_host}:{base_state_zmq_port}"
+                )
+            except Exception as e:
+                print(f"[BaseState] Warning: Failed to initialize ZMQ subscriber: {e}")
+                self._base_state_zmq_socket = None
 
         self.telemetry = Telemetry(window_size=100)
         self.sonic_timing_monitor = TimingThresholdMonitor(
@@ -304,6 +471,21 @@ class GrootDataCollector:
             msg["ros_timestamp"] = time.time()
 
         self.latest_proprio_msg = msg
+
+    def _poll_base_state_zmq(self):
+        if self._base_state_zmq_socket is None:
+            return
+
+        max_polls = 5
+        for _ in range(max_polls):
+            try:
+                raw = self._base_state_zmq_socket.recv(zmq.NOBLOCK)
+            except zmq.Again:
+                break
+
+            parsed = unpack_base_state_message(raw, topic="base_state")
+            if parsed is not None:
+                self.latest_base_state_msg = parsed
 
     def _check_recording_commands(self):
         """Check keyboard + ZMQ toggle flags for recording commands."""
@@ -616,8 +798,17 @@ class GrootDataCollector:
         return self._finalize_frame(t_start)
 
     def _add_cpp_state_features(self, frame_data: dict, proprio: dict) -> None:
-        if "base_quat" in proprio:
-            base_quat = np.asarray(proprio["base_quat"], dtype=np.float64)
+        base_pose_source = (
+            {**proprio, **self.latest_base_state_msg}
+            if self.latest_base_state_msg is not None
+            else proprio
+        )
+
+        frame_data["robot.base_pos"] = _extract_base_pos(base_pose_source)
+        frame_data["robot.base_quat"] = _extract_base_quat(base_pose_source)
+
+        if self.latest_base_state_msg is not None or "base_quat" in proprio:
+            base_quat = frame_data["robot.base_quat"]
             frame_data["observation.root_orientation"] = base_quat
             frame_data["observation.projected_gravity"] = compute_projected_gravity(
                 base_quat
@@ -844,13 +1035,13 @@ class GrootDataCollector:
             self._state_subscriber.close()
         except Exception:
             pass
-        for sock in [self._sonic_zmq_socket]:
+        for sock in [self._sonic_zmq_socket, self._base_state_zmq_socket]:
             if sock is not None:
                 try:
                     sock.close()
                 except Exception:
                     pass
-        for ctx in [self._sonic_zmq_ctx]:
+        for ctx in [self._sonic_zmq_ctx, self._base_state_zmq_ctx]:
             if ctx is not None:
                 try:
                     ctx.term()
@@ -866,6 +1057,9 @@ class GrootDataCollector:
                 with self.telemetry.timer("total_loop"):
                     with self.telemetry.timer("poll_state"):
                         self._poll_state_zmq()
+
+                    with self.telemetry.timer("poll_base_state"):
+                        self._poll_base_state_zmq()
 
                     with self.telemetry.timer("poll_sonic"):
                         self._poll_sonic_zmq_messages()
@@ -912,7 +1106,28 @@ def main(config: SonicDataExporterConfig):
     g1_rm = get_g1_robot_model()
 
     dataset_features = get_features_sonic_vla(g1_rm)
+    dataset_features["robot.base_pos"] = {
+        "dtype": "float64",
+        "shape": (3,),
+        "names": ["base_x", "base_y", "base_z"],
+    }
+    dataset_features["robot.base_quat"] = {
+        "dtype": "float64",
+        "shape": (4,),
+        "names": ["base_qw", "base_qx", "base_qy", "base_qz"],
+    }
     modality_config = get_modality_config_sonic_vla(g1_rm)
+    modality_config.setdefault("state", {})["base_pos"] = {
+        "start": 0,
+        "end": 3,
+        "original_key": "robot.base_pos",
+    }
+    modality_config.setdefault("state", {})["base_quat"] = {
+        "start": 0,
+        "end": 4,
+        "original_key": "robot.base_quat",
+        "rotation_type": "quaternion",
+    }
 
     if config.record_wrist_cameras:
         print("[Camera] Wrist cameras enabled — adding to dataset schema")
@@ -936,7 +1151,11 @@ def main(config: SonicDataExporterConfig):
         features=dataset_features,
         modality_config=modality_config,
         task=config.task_prompt,
-        script_config={**robot_config, "record_wrist_cameras": config.record_wrist_cameras},
+        script_config={
+            **robot_config,
+            "record_wrist_cameras": config.record_wrist_cameras,
+            "records_base_pos": True,
+        },
     )
 
     data_collector = GrootDataCollector(
@@ -950,6 +1169,8 @@ def main(config: SonicDataExporterConfig):
         sonic_data_zmq_port=config.sonic_zmq_port,
         state_zmq_host=config.state_zmq_host,
         state_zmq_port=config.state_zmq_port,
+        base_state_zmq_host=config.base_state_zmq_host,
+        base_state_zmq_port=config.base_state_zmq_port,
     )
     data_collector.run()
 

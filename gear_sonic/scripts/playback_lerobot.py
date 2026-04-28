@@ -53,7 +53,6 @@ import pathlib
 import time
 from collections import deque
 
-import av
 import mujoco
 import mujoco.viewer
 import numpy as np
@@ -70,13 +69,22 @@ _ENV_XML = {
     "pnp_cube":          "decoupled_wbc/control/robot_model/model_data/g1/pnp_cube_43dof.xml",
     "lift_box":          "decoupled_wbc/control/robot_model/model_data/g1/lift_box_43dof.xml",
     "pnp_bottle":        "decoupled_wbc/control/robot_model/model_data/g1/pnp_bottle_43dof.xml",
-    "default":           "decoupled_wbc/control/robot_model/model_data/g1/scene_43dof.xml",
+    "default":           "gear_sonic/data/robot_model/model_data/g1/scene_43dof.xml",
 }
 
 # 43-DOF slice → body (29) de-assembly
 _BODY_IDX = np.concatenate([np.arange(22), np.arange(29, 36)])  # 29 joints
 _LEFT_HAND_IDX = np.arange(22, 29)   # 7 joints
 _RIGHT_HAND_IDX = np.arange(36, 43)  # 7 joints
+_HAND_JOINT_SUFFIXES = [
+    "index_0_joint",
+    "index_1_joint",
+    "middle_0_joint",
+    "middle_1_joint",
+    "thumb_0_joint",
+    "thumb_1_joint",
+    "thumb_2_joint",
+]
 # Upper-body body joints in 43-DOF layout: waist(12:15), left_arm(15:22), right_arm(29:36)
 _WAIST_IDX = np.arange(12, 15)
 _LEFT_ARM_IDX = np.arange(15, 22)
@@ -697,15 +705,23 @@ def _load_xml(env_name: str) -> mujoco.MjModel:
 
 def _build_joint_indices(model: mujoco.MjModel):
     """Return (body_joint_index, left_hand_index, right_hand_index) — arrays of MuJoCo joint ids."""
-    body, left_hand, right_hand = [], [], []
+    body = []
     for i in range(model.njnt):
         name = model.joint(i).name
         if any(k in name for k in _BODY_JOINT_KEYS):
             body.append(i)
-        elif "left_hand" in name:
-            left_hand.append(i)
-        elif "right_hand" in name:
-            right_hand.append(i)
+
+    def _hand_ids(side: str) -> list[int]:
+        ids = []
+        for suffix in _HAND_JOINT_SUFFIXES:
+            name = f"{side}_hand_{suffix}"
+            jid = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_JOINT, name)
+            if jid >= 0:
+                ids.append(jid)
+        return ids
+
+    left_hand = _hand_ids("left")
+    right_hand = _hand_ids("right")
     return np.array(body), np.array(left_hand), np.array(right_hand)
 
 
@@ -814,7 +830,7 @@ def _load_episode(dataset_dir: str, episode: int, sonic: bool = False):
 
     Returns:
         states:         float32 [T, 43] measured joint positions
-        actions:        float64 [T, 43] reference actions
+        actions:        float64 [T, 43] reference actions, or None for state-only playback
         task_indices:   list of task_index per frame
         base_pos:       float64 [T, 3] or None
         base_quat:      float64 [T, 4] wxyz or None
@@ -837,10 +853,32 @@ def _load_episode(dataset_dir: str, episode: int, sonic: bool = False):
         raise FileNotFoundError(f"Parquet not found: {path}")
 
     schema = pq.read_schema(path)
-    cols = ["observation.state", "action", "task_index"]
-    has_base = "robot.base_pos" in schema.names and "robot.base_quat" in schema.names
-    if has_base:
-        cols += ["robot.base_pos", "robot.base_quat"]
+    action_col = None
+    if "action" in schema.names:
+        action_col = "action"
+    elif "action.wbc" in schema.names:
+        action_col = "action.wbc"
+
+    cols = ["observation.state", "task_index"]
+    if sonic:
+        if action_col is None:
+            raise ValueError(
+                "SONIC playback requires an action column, but neither 'action' nor "
+                "'action.wbc' was found. For pure state playback, omit --sonic_encoder."
+            )
+        cols.append(action_col)
+    has_base_pos = "robot.base_pos" in schema.names
+    base_quat_col = None
+    if "robot.base_quat" in schema.names:
+        base_quat_col = "robot.base_quat"
+    elif "observation.root_orientation" in schema.names:
+        # Older datasets store the pelvis/root orientation here instead of robot.base_quat.
+        base_quat_col = "observation.root_orientation"
+    has_base = has_base_pos and base_quat_col == "robot.base_quat"
+    if has_base_pos:
+        cols.append("robot.base_pos")
+    if base_quat_col is not None:
+        cols.append(base_quat_col)
 
     has_smpl = ("pico.smpl_joints" in schema.names and
                 "pico.body_root_quat" in schema.names and
@@ -852,8 +890,8 @@ def _load_episode(dataset_dir: str, episode: int, sonic: bool = False):
         )
     if sonic:
         cols += ["pico.smpl_joints", "pico.body_root_quat"]
-        if "robot.base_quat" not in cols:
-            cols.append("robot.base_quat")
+        if base_quat_col is not None and base_quat_col not in cols:
+            cols.append(base_quat_col)
         if "robot.base_ang_vel" in schema.names:
             cols.append("robot.base_ang_vel")
         if "robot.body_dq" in schema.names:
@@ -872,18 +910,21 @@ def _load_episode(dataset_dir: str, episode: int, sonic: bool = False):
     table = pq.read_table(path, columns=cols)
 
     states  = np.array([r.as_py() for r in table.column("observation.state")], dtype=np.float32)
-    actions = np.array([r.as_py() for r in table.column("action")], dtype=np.float64)
+    actions = None
+    if action_col is not None and action_col in table.column_names:
+        actions = np.array([r.as_py() for r in table.column(action_col)], dtype=np.float64)
     task_indices = table.column("task_index").to_pylist()
 
     base_pos = base_quat = base_ang_vel = body_dq = smpl_joints = body_root_quat = None
     enc_obs_rec = token_rec = dec_obs_rec = dec_action_rec = q_target_cmd = None
-    if has_base:
-        base_pos  = np.array([r.as_py() for r in table.column("robot.base_pos")],  dtype=np.float64)
-        base_quat = np.array([r.as_py() for r in table.column("robot.base_quat")], dtype=np.float64)
+    if has_base_pos:
+        base_pos = np.array([r.as_py() for r in table.column("robot.base_pos")], dtype=np.float64)
+    if base_quat_col is not None:
+        base_quat = np.array([r.as_py() for r in table.column(base_quat_col)], dtype=np.float64)
     if sonic:
         smpl_joints    = np.array([r.as_py() for r in table.column("pico.smpl_joints")],    dtype=np.float32)
         body_root_quat = np.array([r.as_py() for r in table.column("pico.body_root_quat")], dtype=np.float32)
-        if base_quat is None:
+        if base_quat is None and "robot.base_quat" in table.column_names:
             base_quat = np.array([r.as_py() for r in table.column("robot.base_quat")], dtype=np.float64)
         if "robot.base_ang_vel" in table.column_names:
             base_ang_vel = np.array([r.as_py() for r in table.column("robot.base_ang_vel")], dtype=np.float64)
@@ -920,13 +961,23 @@ def _set_qpos(data: mujoco.MjData, model: mujoco.MjModel,
         data.qpos[model.jnt_qposadr[left_jids]] = left7
     if len(right_jids):
         data.qpos[model.jnt_qposadr[right_jids]] = right7
-    if root_jid is not None and base_pos is not None and base_quat is not None:
+    if root_jid is not None:
         adr = model.jnt_qposadr[root_jid]
-        data.qpos[adr:adr + 3] = base_pos
-        data.qpos[adr + 3:adr + 7] = base_quat
+        if base_pos is not None:
+            data.qpos[adr:adr + 3] = base_pos
+        if base_quat is not None:
+            data.qpos[adr + 3:adr + 7] = base_quat
 
 
 def _make_video_writer(path: str, width: int, height: int, fps: float):
+    try:
+        import av
+    except ImportError as exc:
+        raise ImportError(
+            "PyAV is only required when --output_video is used. Install it with "
+            "`pip install av`, or omit --output_video for viewer-only playback."
+        ) from exc
+
     container = av.open(path, "w")
     stream = container.add_stream("h264", rate=int(fps))
     stream.width  = width
@@ -954,6 +1005,7 @@ def playback(
     compare: bool,
     physics: bool = False,
     upper_body_from_action: bool = False,
+    debug_state: bool = False,
 ):
     # 1. Load data
     use_sonic = sonic_runner is not None
@@ -964,8 +1016,15 @@ def playback(
     T = len(states)
 
     task_index = task_indices[0] if task_indices else None
+    fixed_base_pos = None
     if base_pos is not None:
         print(f"Root pose loaded: base_pos x range [{base_pos[:,0].min():.3f}, {base_pos[:,0].max():.3f}] m")
+    elif base_quat is not None:
+        fixed_base_pos = np.tile(np.array([0.0, 0.0, _ROOT_HEIGHT], dtype=np.float64), (T, 1))
+        print(
+            "Root position not in dataset — using fixed standing height with recorded "
+            "pelvis/root orientation."
+        )
     else:
         print("Warning: robot.base_pos/base_quat not in dataset — root fixed at (0,0,0.8).")
 
@@ -1051,7 +1110,7 @@ def playback(
     model.vis.global_.offwidth  = video_width
     model.vis.global_.offheight = video_height
 
-    cam_writers: dict[str, tuple] = {}  # cam → (renderer, container, stream)
+    cam_writers: dict[str, tuple] = {}  # cam → (renderer, container, stream, av module)
     for cam in resolved_cams:
         if output_video is None:
             continue
@@ -1062,7 +1121,8 @@ def playback(
             vid_path = str(p.parent / f"{p.stem}_{cam}{p.suffix}")
         renderer = mujoco.Renderer(model, height=video_height, width=video_width)
         container, stream = _make_video_writer(vid_path, video_width, video_height, fps)
-        cam_writers[cam] = (renderer, container, stream)
+        import av
+        cam_writers[cam] = (renderer, container, stream, av)
         print(f"Saving video [{cam}] → {vid_path}  ({video_width}×{video_height} @ {fps:.0f} fps)")
 
     # 5. Launch onscreen viewer
@@ -1126,7 +1186,7 @@ def playback(
         for i, state in enumerate(states):
             t_start = time.perf_counter()
 
-            bp = base_pos[i]  if base_pos  is not None else None
+            bp = base_pos[i] if base_pos is not None else (fixed_base_pos[i] if fixed_base_pos is not None else None)
             bq = base_quat[i] if base_quat is not None else None
 
             if use_sonic:
@@ -1235,10 +1295,19 @@ def playback(
             if not physics:
                 _set_qpos(data, model, body_jids, left_jids, right_jids, display_state,
                           root_jid=root_jid, base_pos=bp, base_quat=bq)
+                if debug_state and not use_sonic and (i < 10 or (i + 1) % 100 == 0 or i == T - 1):
+                    left_leg = display_state[0:6]
+                    right_leg = display_state[6:12]
+                    print(
+                        "    pure_state "
+                        f"base_pos={np.round(bp, 4) if bp is not None else None} "
+                        f"left_leg={np.round(left_leg, 4)} "
+                        f"right_leg={np.round(right_leg, 4)}"
+                    )
             mujoco.mj_forward(model, data)
 
             # Render each camera
-            for cam, (renderer, container, stream) in cam_writers.items():
+            for cam, (renderer, container, stream, av) in cam_writers.items():
                 renderer.update_scene(data, camera=cam)
                 rgb = renderer.render()
                 frame = av.VideoFrame.from_ndarray(rgb, format="rgb24")
@@ -1327,6 +1396,8 @@ def main():
     parser.add_argument("--upper_body_from_action", action="store_true",
                         help="Override SONIC upper-body joints with recorded action targets "
                              "(waist + left/right 7-DoF arms) to improve visual match.")
+    parser.add_argument("--debug_state", action="store_true",
+                        help="Print recorded base/leg state values as they are written to qpos.")
     args = parser.parse_args()
 
     # Resolve camera list
@@ -1362,6 +1433,7 @@ def main():
         compare      = args.compare,
         physics      = args.physics,
         upper_body_from_action = args.upper_body_from_action,
+        debug_state  = args.debug_state,
     )
 
 

@@ -120,6 +120,7 @@ protected:
      *   base_trans_target      |  3   | Target base translation (heading-corrected).
      *   base_quat_target       |  4   | Target base quaternion (heading-corrected).
      *   body_q_target          | 29   | Target joint positions (MuJoCo order).
+     *   base_pos               |  3   | Alias of base_trans_target for downstream exporters.
      *   base_trans_measured    |  3   | Measured base translation (fixed default).
      *   base_quat_measured     |  4   | Measured base quaternion from IMU.
      *   body_q_measured        | 29   | Measured joint positions (MuJoCo order + default offsets).
@@ -148,6 +149,7 @@ protected:
         static const std::string kBaseTransTarget = "base_trans_target";
         static const std::string kBaseQuatTarget = "base_quat_target";
         static const std::string kBodyQTarget = "body_q_target";
+        static const std::string kBasePos = "base_pos";
         static const std::string kBaseTransMeasured = "base_trans_measured";
         static const std::string kBaseQuatMeasured = "base_quat_measured";
         static const std::string kBodyQMeasured = "body_q_measured";
@@ -258,6 +260,7 @@ protected:
         output_data_map_[kBaseTransTarget].assign(base_trans_target.begin(), base_trans_target.end());
         output_data_map_[kBaseQuatTarget].assign(base_quat_target.begin(), base_quat_target.end());
         output_data_map_[kBodyQTarget].assign(body_q_target.begin(), body_q_target.end());
+        output_data_map_[kBasePos].assign(base_trans_target.begin(), base_trans_target.end());
 
         output_data_map_[kBaseTransMeasured].assign(base_trans_measured.begin(), base_trans_measured.end());
         output_data_map_[kBaseQuatMeasured].assign(base_quat_measured.begin(), base_quat_measured.end());
@@ -293,4 +296,3 @@ protected:
 };
 
 #endif // OUTPUT_INTERFACE_HPP
-
