@@ -390,6 +390,9 @@ class G1Deploy {
     // Pre-allocated observation buffers to avoid allocation in control loop
     std::vector<double> obs_buffer_;          // Policy observation buffer
     std::vector<double> encoder_obs_buffer_;  // Encoder observation buffer
+    std::vector<double> last_decoder_obs_;  // Policy input used for the latest inference
+    std::vector<double> last_decoder_action_raw_;  // Raw policy output in model order
+    std::vector<double> last_body_motor_cmd_q_;  // Final body q targets in MuJoCo order
     
     // Observation configuration
     std::vector<ObservationConfig> obs_config_; 
@@ -3104,6 +3107,7 @@ class G1Deploy {
       for (size_t i = 0; i < obs_buffer_.size(); i++) { 
         obs_buffer_float[i] = static_cast<float>(obs_buffer_[i]); 
       }
+      last_decoder_obs_ = obs_buffer_;
 
       // Run policy inference (handles CPU→GPU transfer, inference, GPU→CPU transfer)
       if (!policy_engine_->Infer()) {
@@ -3116,6 +3120,8 @@ class G1Deploy {
       float* floatarr = action_buffer.data();
       
       MotorCommand motor_command_tmp;
+      last_decoder_action_raw_.assign(G1_NUM_MOTOR, 0.0);
+      last_body_motor_cmd_q_.assign(G1_NUM_MOTOR, 0.0);
       for (int i = 0; i < G1_NUM_MOTOR; i++) {
         const double action_value = static_cast<double>(floatarr[isaaclab_to_mujoco[i]]) * g1_action_scale[i];
         last_action[i] = static_cast<double>(floatarr[i]);
@@ -3124,6 +3130,8 @@ class G1Deploy {
         motor_command_tmp.kp.at(i) = kps[i];
         motor_command_tmp.kd.at(i) = kds[i];
         motor_command_tmp.dq_target.at(i) = 0.0;
+        last_decoder_action_raw_[i] = static_cast<double>(floatarr[i]);
+        last_body_motor_cmd_q_[i] = static_cast<double>(motor_command_tmp.q_target.at(i));
       }
       motor_command_buffer_.SetData(motor_command_tmp);
       return true;
@@ -3928,15 +3936,6 @@ class G1Deploy {
             }
           } // Release lock after all observation-dependent operations
 
-          // Log post-state data (token state) to the most recent state logger entry
-          // This must be called after GatherObservations() which populates token_state_data_
-          if (state_logger_) {
-            std::string motion_name = current_motion_copy ? current_motion_copy->name : "";
-            if (!state_logger_->LogPostState(std::span(token_state_data_), current_encoder_mode_copy, motion_name, current_play_copy)) {
-              std::cerr << "[WARNING] Failed to log token state to state logger" << std::endl;
-            }
-          }
-
           auto obs_end_time = std::chrono::steady_clock::now();
 
           if (!CreatePolicyCommand()) {
@@ -3944,6 +3943,22 @@ class G1Deploy {
             std::cout << "Stopping control system." << std::endl;
             operator_state.stop = true;
             return;
+          }
+
+          // Log the exact ONNX inputs/outputs after policy inference so q_target_cmd is available.
+          if (state_logger_) {
+            std::string motion_name = current_motion_copy ? current_motion_copy->name : "";
+            if (!state_logger_->LogPostState(
+                    std::span<const double>(token_state_data_),
+                    current_encoder_mode_copy,
+                    motion_name,
+                    current_play_copy,
+                    std::span<const double>(encoder_obs_buffer_),
+                    std::span<const double>(last_decoder_obs_),
+                    std::span<const double>(last_decoder_action_raw_),
+                    std::span<const double>(last_body_motor_cmd_q_))) {
+              std::cerr << "[WARNING] Failed to log ONNX debug state to state logger" << std::endl;
+            }
           }
           auto motor_command_end_time = std::chrono::steady_clock::now();
 

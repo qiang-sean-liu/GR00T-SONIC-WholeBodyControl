@@ -136,7 +136,14 @@ uint64_t StateLogger::LogFullState(const std::array<double, 4>& base_quat,
   return e.index;
 }
 
-bool StateLogger::LogPostState(const std::span<double>& token_state, int encoder_mode, const std::string& motion_name, bool play) {
+bool StateLogger::LogPostState(const std::span<const double>& token_state,
+                               int encoder_mode,
+                               const std::string& motion_name,
+                               bool play,
+                               std::span<const double> encoder_obs,
+                               std::span<const double> decoder_obs,
+                               std::span<const double> decoder_action_raw,
+                               std::span<const double> body_motor_cmd_q) {
   std::lock_guard<std::mutex> lock(ring_mutex_);
 
   // Check if we have any entries
@@ -158,6 +165,10 @@ bool StateLogger::LogPostState(const std::span<double>& token_state, int encoder
 
   // Update the entry with token state and metadata
   newest.token_state.assign(std::begin(token_state), std::end(token_state));
+  newest.encoder_obs.assign(std::begin(encoder_obs), std::end(encoder_obs));
+  newest.decoder_obs.assign(std::begin(decoder_obs), std::end(decoder_obs));
+  newest.decoder_action_raw.assign(std::begin(decoder_action_raw), std::end(decoder_action_raw));
+  newest.body_motor_cmd_q.assign(std::begin(body_motor_cmd_q), std::end(body_motor_cmd_q));
   newest.encoder_mode = encoder_mode;
   newest.motion_name = motion_name;
   newest.play = play;

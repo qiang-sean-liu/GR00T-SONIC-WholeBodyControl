@@ -279,9 +279,9 @@ private:
             has_heading_state = true;
         }
 
-        // State-logger fields: 18 base + 2 optional heading
+        // State-logger fields: 22 base + 2 optional heading
         // Visualisation fields: output_data_map_.size() (typically 11)
-        int num_state_fields = has_heading_state ? 20 : 18;
+        int num_state_fields = has_heading_state ? 24 : 22;
         int num_viz_fields = static_cast<int>(output_data_map_.size());
         pk.pack_map(num_state_fields + num_viz_fields);
 
@@ -379,6 +379,22 @@ private:
         } else {
             pk.pack_array(0);
         }
+
+        pk.pack("encoder_obs");
+        pk.pack_array(state.encoder_obs.size());
+        for (const auto& val : state.encoder_obs) pk.pack(val);
+
+        pk.pack("decoder_obs");
+        pk.pack_array(state.decoder_obs.size());
+        for (const auto& val : state.decoder_obs) pk.pack(val);
+
+        pk.pack("decoder_action_raw");
+        pk.pack_array(state.decoder_action_raw.size());
+        for (const auto& val : state.decoder_action_raw) pk.pack(val);
+
+        pk.pack("q_target_cmd");
+        pk.pack_array(state.body_motor_cmd_q.size());
+        for (const auto& val : state.body_motor_cmd_q) pk.pack(val);
 
         // Motor temperature: hardware order, 2 values per motor (winding, driver)
         pk.pack("motor_temperature");

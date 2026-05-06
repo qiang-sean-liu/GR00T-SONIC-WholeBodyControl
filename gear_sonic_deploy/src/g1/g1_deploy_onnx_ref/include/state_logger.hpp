@@ -114,6 +114,10 @@ class StateLogger {
     // Post-state data (set after initial state logging via LogPostState)
     bool has_post_state_data = false;
     std::vector<double> token_state;  // Token/latent state from encoder
+    std::vector<double> encoder_obs;  // Exact encoder input buffer
+    std::vector<double> decoder_obs;  // Exact policy/decoder input buffer
+    std::vector<double> decoder_action_raw;  // Raw policy/decoder output
+    std::vector<double> body_motor_cmd_q;  // Final body q targets in MuJoCo order
     int encoder_mode = -2;          // Encoder mode when token state was generated; -2: no token state, -1: need token but no encoder, 0,1,2,...: encoder mode.
     std::string motion_name = "";   // Name of the motion sequence being executed
     bool play = false;              // Operator play state (controls motion playback)
@@ -182,7 +186,14 @@ class StateLogger {
    * @param motion_name Name of the current motion sequence being executed
    * @param play Operator play state (controls motion playback)
    */
-  bool LogPostState(const std::span<double>& token_state, int encoder_mode = -2, const std::string& motion_name = "", bool play = false);
+  bool LogPostState(const std::span<const double>& token_state,
+                    int encoder_mode = -2,
+                    const std::string& motion_name = "",
+                    bool play = false,
+                    std::span<const double> encoder_obs = {},
+                    std::span<const double> decoder_obs = {},
+                    std::span<const double> decoder_action_raw = {},
+                    std::span<const double> body_motor_cmd_q = {});
 
   size_t capacity() const;
   size_t size() const;

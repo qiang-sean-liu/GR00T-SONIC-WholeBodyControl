@@ -883,13 +883,24 @@ def _load_episode(dataset_dir: str, episode: int, sonic: bool = False):
     has_smpl = ("pico.smpl_joints" in schema.names and
                 "pico.body_root_quat" in schema.names and
                 "robot.base_quat" in schema.names)
-    if sonic and not has_smpl:
+    has_exact_onnx = all(
+        name in schema.names
+        for name in (
+            "sonic.encoder_obs",
+            "sonic.token_state",
+            "sonic.decoder_obs",
+            "sonic.decoder_action_raw",
+            "sonic.q_target_cmd",
+        )
+    )
+    if sonic and not has_smpl and not has_exact_onnx:
         raise ValueError(
-            "SONIC mode requires pico.smpl_joints, pico.body_root_quat, robot.base_quat columns "
-            "(v2.2+ dataset). Re-convert with convert_sonic_to_lerobot.py."
+            "SONIC mode requires either exact sonic.* ONNX columns or "
+            "pico.smpl_joints, pico.body_root_quat, robot.base_quat columns (v2.2+ dataset)."
         )
     if sonic:
-        cols += ["pico.smpl_joints", "pico.body_root_quat"]
+        if has_smpl:
+            cols += ["pico.smpl_joints", "pico.body_root_quat"]
         if base_quat_col is not None and base_quat_col not in cols:
             cols.append(base_quat_col)
         if "robot.base_ang_vel" in schema.names:
@@ -922,8 +933,10 @@ def _load_episode(dataset_dir: str, episode: int, sonic: bool = False):
     if base_quat_col is not None:
         base_quat = np.array([r.as_py() for r in table.column(base_quat_col)], dtype=np.float64)
     if sonic:
-        smpl_joints    = np.array([r.as_py() for r in table.column("pico.smpl_joints")],    dtype=np.float32)
-        body_root_quat = np.array([r.as_py() for r in table.column("pico.body_root_quat")], dtype=np.float32)
+        if "pico.smpl_joints" in table.column_names:
+            smpl_joints = np.array([r.as_py() for r in table.column("pico.smpl_joints")], dtype=np.float32)
+        if "pico.body_root_quat" in table.column_names:
+            body_root_quat = np.array([r.as_py() for r in table.column("pico.body_root_quat")], dtype=np.float32)
         if base_quat is None and "robot.base_quat" in table.column_names:
             base_quat = np.array([r.as_py() for r in table.column("robot.base_quat")], dtype=np.float64)
         if "robot.base_ang_vel" in table.column_names:
@@ -1143,10 +1156,17 @@ def playback(
     # 6. Pre-compute encoder future-window arrays (SONIC mode only)
     body_root_quat_corr = wrist_all = None
     if use_sonic:
-        bq_arr = base_quat if base_quat is not None else np.tile([1., 0., 0., 0.], (T, 1))
-        body_root_quat_corr, wrist_all = SonicRunner.precompute(
-            smpl_joints, body_root_quat, bq_arr, actions
-        )
+        if smpl_joints is not None and body_root_quat is not None:
+            bq_arr = base_quat if base_quat is not None else np.tile([1., 0., 0., 0.], (T, 1))
+            body_root_quat_corr, wrist_all = SonicRunner.precompute(
+                smpl_joints, body_root_quat, bq_arr, actions
+            )
+        else:
+            smpl_joints = np.zeros((T, 72), dtype=np.float32)
+            body_root_quat_corr = np.tile(
+                np.array([1., 0., 0., 0.], dtype=np.float32), (T, 1)
+            )
+            wrist_all = np.zeros((T, 6), dtype=np.float32)
 
     # 7. Stats for --compare
     compare_l2s       = [] if compare else None  # SONIC vs recorded actions (reference targets)

@@ -15,11 +15,13 @@ import time
 from typing import Dict
 import xml.etree.ElementTree as ET
 
+import msgpack
 import mujoco
 import mujoco.viewer
 import numpy as np
 from scipy.spatial.transform import Rotation
 from unitree_sdk2py.core.channel import ChannelFactoryInitialize
+import zmq
 
 from gear_sonic.utils.mujoco_sim.metric_utils import check_contact, check_height
 from gear_sonic.utils.mujoco_sim.sim_utils import get_subtree_body_names
@@ -69,6 +71,7 @@ class DefaultEnv:
             self.init_renderers()
         self.image_dt = self.config.get("IMAGE_DT", 0.033333)
         self.image_publish_process = None
+        self._body_pd_substep_history = []
 
     def start_image_publish_subprocess(self, start_method: str = "spawn", camera_port: int = 5555):
         from gear_sonic.utils.mujoco_sim.image_publish_utils import ImagePublishProcess
@@ -427,9 +430,120 @@ class DefaultEnv:
             self.mj_data.ctrl = np.concatenate((np.zeros(6), self.torques))
         else:
             self.mj_data.ctrl = self.torques
+        pre_step_snapshot = self._make_body_pd_substep_snapshot(body_torques)
         mujoco.mj_step(self.mj_model, self.mj_data)
+        self._record_body_pd_substep(pre_step_snapshot)
 
         self.check_fall()
+
+    def _motor_cmd_array(self, field: str, length: int) -> np.ndarray:
+        values = np.full(length, np.nan, dtype=np.float64)
+        if self.unitree_bridge is None or self.unitree_bridge.low_cmd is None:
+            return values
+        for i in range(min(length, self.unitree_bridge.num_body_motor)):
+            values[i] = float(getattr(self.unitree_bridge.low_cmd.motor_cmd[i], field))
+        return values
+
+    def _make_body_pd_substep_snapshot(self, body_torques: np.ndarray) -> dict[str, np.ndarray | float]:
+        q = self.mj_data.qpos[self.body_joint_index + self.qpos_offset - 1].copy()
+        dq = self.mj_data.qvel[self.body_joint_index + self.qvel_offset - 1].copy()
+        q_des = self._motor_cmd_array("q", self.num_body_dof)
+        dq_des = self._motor_cmd_array("dq", self.num_body_dof)
+        kp = self._motor_cmd_array("kp", self.num_body_dof)
+        kd = self._motor_cmd_array("kd", self.num_body_dof)
+        tau_ff = self._motor_cmd_array("tau", self.num_body_dof)
+        torque_raw = tau_ff + kp * (q_des - q) + kd * (dq_des - dq)
+
+        return {
+            "q": q,
+            "dq": dq,
+            "q_des": q_des,
+            "dq_des": dq_des,
+            "kp": kp,
+            "kd": kd,
+            "tau_ff": tau_ff,
+            "torque_raw": torque_raw,
+            "torque": body_torques.copy(),
+            "sim_time": float(self.mj_data.time),
+            "wall_time": float(time.time()),
+            "qpos": self.mj_data.qpos.copy(),
+            "qvel": self.mj_data.qvel.copy(),
+            "ctrl": self.mj_data.ctrl.copy(),
+            "qfrc_applied": self.mj_data.qfrc_applied.copy(),
+            "xfrc_applied": self.mj_data.xfrc_applied.copy().reshape(-1),
+            "qacc_warmstart": self.mj_data.qacc_warmstart.copy(),
+        }
+
+    def _record_body_pd_substep(self, snapshot: dict[str, np.ndarray | float]) -> None:
+        snapshot["post_qpos"] = self.mj_data.qpos.copy()
+        snapshot["post_qvel"] = self.mj_data.qvel.copy()
+        snapshot["post_qacc"] = self.mj_data.qacc.copy()
+        snapshot["post_actuator_force"] = self.mj_data.actuator_force.copy()
+        snapshot["post_sim_time"] = float(self.mj_data.time)
+        snapshot["post_wall_time"] = float(time.time())
+        self._body_pd_substep_history.append(snapshot)
+        max_substeps = int(round(0.02 / self.sim_dt)) if self.sim_dt > 0 else 4
+        max_substeps = max(1, max_substeps)
+        self._body_pd_substep_history = self._body_pd_substep_history[-max_substeps:]
+
+    def get_base_state_debug(self) -> dict[str, list[float] | float]:
+        msg: dict[str, list[float] | float] = {
+            "base_pos_sim": self.mj_data.qpos[:3].astype(np.float64).tolist(),
+            "base_quat_sim": self.mj_data.qpos[3:7].astype(np.float64).tolist(),
+            "qpos": self.mj_data.qpos.astype(np.float64).tolist(),
+            "qvel": self.mj_data.qvel.astype(np.float64).tolist(),
+            "sim_timestamp": float(self.mj_data.time),
+            "mujoco_timestamp": float(self.mj_data.time),
+            "timestamp": float(time.time()),
+        }
+
+        history = self._body_pd_substep_history
+        if not history:
+            return msg
+
+        def flatten_array(name: str) -> list[float]:
+            return np.concatenate([np.asarray(s[name], dtype=np.float64).reshape(-1) for s in history]).tolist()
+
+        def flatten_scalar(name: str) -> list[float]:
+            return [float(s[name]) for s in history]
+
+        msg.update(
+            {
+                "motor_pd_torque": np.asarray(history[-1]["torque"], dtype=np.float64).tolist(),
+                "motor_pd_torque_raw": np.asarray(history[-1]["torque_raw"], dtype=np.float64).tolist(),
+                "motor_pd_q": np.asarray(history[-1]["q"], dtype=np.float64).tolist(),
+                "motor_pd_dq": np.asarray(history[-1]["dq"], dtype=np.float64).tolist(),
+                "motor_pd_q_des": np.asarray(history[-1]["q_des"], dtype=np.float64).tolist(),
+                "motor_pd_dq_des": np.asarray(history[-1]["dq_des"], dtype=np.float64).tolist(),
+                "motor_pd_kp": np.asarray(history[-1]["kp"], dtype=np.float64).tolist(),
+                "motor_pd_kd": np.asarray(history[-1]["kd"], dtype=np.float64).tolist(),
+                "motor_pd_tau_ff": np.asarray(history[-1]["tau_ff"], dtype=np.float64).tolist(),
+                "motor_pd_substep_q": flatten_array("q"),
+                "motor_pd_substep_dq": flatten_array("dq"),
+                "motor_pd_substep_q_des": flatten_array("q_des"),
+                "motor_pd_substep_dq_des": flatten_array("dq_des"),
+                "motor_pd_substep_kp": flatten_array("kp"),
+                "motor_pd_substep_kd": flatten_array("kd"),
+                "motor_pd_substep_tau_ff": flatten_array("tau_ff"),
+                "motor_pd_substep_torque_raw": flatten_array("torque_raw"),
+                "motor_pd_substep_torque": flatten_array("torque"),
+                "motor_pd_substep_sim_time": flatten_scalar("sim_time"),
+                "motor_pd_substep_wall_time": flatten_scalar("wall_time"),
+                "mujoco_substep_qpos": flatten_array("qpos"),
+                "mujoco_substep_qvel": flatten_array("qvel"),
+                "mujoco_substep_ctrl": flatten_array("ctrl"),
+                "mujoco_substep_qfrc_applied": flatten_array("qfrc_applied"),
+                "mujoco_substep_xfrc_applied": flatten_array("xfrc_applied"),
+                "mujoco_substep_qacc_warmstart": flatten_array("qacc_warmstart"),
+                "mujoco_substep_post_qpos": flatten_array("post_qpos"),
+                "mujoco_substep_post_qvel": flatten_array("post_qvel"),
+                "mujoco_substep_post_qacc": flatten_array("post_qacc"),
+                "mujoco_substep_post_actuator_force": flatten_array("post_actuator_force"),
+                "mujoco_substep_post_sim_time": flatten_scalar("post_sim_time"),
+                "mujoco_substep_post_wall_time": flatten_scalar("post_wall_time"),
+            }
+        )
+        return msg
 
     def apply_perturbation(self, key):
         perturbation_x_body = 0.0
@@ -574,6 +688,10 @@ class BaseSimulator:
         self.init_publisher()
 
         self.sim_thread = None
+        self._base_state_zmq_ctx = None
+        self._base_state_zmq_socket = None
+        self._base_state_topic = "base_state"
+        self._init_base_state_publisher()
 
     def start_as_thread(self):
         self.sim_thread = Thread(target=self.start)
@@ -581,6 +699,35 @@ class BaseSimulator:
 
     def start_image_publish_subprocess(self, start_method: str = "spawn", camera_port: int = 5555):
         self.sim_env.start_image_publish_subprocess(start_method, camera_port)
+
+    def _init_base_state_publisher(self):
+        if not self.config.get("ENABLE_BASE_STATE_ZMQ", True):
+            return
+        port = int(self.config.get("BASE_STATE_ZMQ_PORT", 5558))
+        try:
+            self._base_state_zmq_ctx = zmq.Context()
+            self._base_state_zmq_socket = self._base_state_zmq_ctx.socket(zmq.PUB)
+            self._base_state_zmq_socket.setsockopt(zmq.SNDHWM, 5)
+            self._base_state_zmq_socket.setsockopt(zmq.LINGER, 0)
+            self._base_state_zmq_socket.bind(f"tcp://*:{port}")
+            print(f"[BaseState] Publishing MuJoCo debug state on tcp://*:{port}")
+        except Exception as exc:
+            print(f"[BaseState] Warning: failed to start publisher on port {port}: {exc}")
+            self._base_state_zmq_socket = None
+
+    def _publish_base_state(self):
+        if self._base_state_zmq_socket is None:
+            return
+        msg = self.sim_env.get_base_state_debug()
+        msg["zmq_send_timestamp"] = float(time.time())
+        payload = msgpack.packb(msg, use_bin_type=True)
+        try:
+            self._base_state_zmq_socket.send(
+                self._base_state_topic.encode("utf-8") + payload,
+                flags=zmq.NOBLOCK,
+            )
+        except zmq.Again:
+            pass
 
     def init_subscriber(self):
         pass
@@ -608,6 +755,7 @@ class BaseSimulator:
                 step_start = time.monotonic()
 
                 self.sim_env.sim_step()
+                self._publish_base_state()
                 now = time.time()
                 if now - ts > 1 / 10.0 and self.redis_client is not None:
                     head_pose = self.sim_env.get_head_pose()
@@ -649,6 +797,10 @@ class BaseSimulator:
                 self.sim_env.image_publish_process.stop()
             if self.sim_env.viewer is not None:
                 self.sim_env.viewer.close()
+            if self._base_state_zmq_socket is not None:
+                self._base_state_zmq_socket.close()
+            if self._base_state_zmq_ctx is not None:
+                self._base_state_zmq_ctx.term()
         except Exception as e:
             print(f"Warning during close: {e}")
 
