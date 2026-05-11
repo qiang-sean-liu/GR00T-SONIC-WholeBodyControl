@@ -207,6 +207,39 @@ target_link_libraries(
   ${EXE_LIBS}
 )
 
+# Standalone decoder replay proof tool. This does not link or modify the teleop
+# executable; it only reuses the same PolicyEngine TensorRT path on recorded
+# decoder_obs tensors prepared by the Python wrapper.
+add_executable(replay_policy_engine_decoder_test
+  ${CMAKE_CURRENT_SOURCE_DIR}/tests/replay_policy_engine_decoder_test.cpp)
+target_include_directories(replay_policy_engine_decoder_test PUBLIC
+  ${EXE_INCLUDES}
+  ${PROJECT_SOURCE_DIR}/src)
+target_link_directories(replay_policy_engine_decoder_test PRIVATE ${CUDA_LINK_DIRS})
+target_link_libraries(replay_policy_engine_decoder_test PRIVATE ${PROJECT_NAME} ${EXE_LIBS})
+set_target_properties(
+  replay_policy_engine_decoder_test
+  PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${PROJECT_SOURCE_DIR}/target/release/"
+             OUTPUT_NAME replay_policy_engine_decoder_test
+             CXX_STANDARD 20
+             CXX_STANDARD_REQUIRED ON
+             CXX_EXTENSIONS OFF)
+
+add_executable(sonic_trt_inference_bridge
+  ${CMAKE_CURRENT_SOURCE_DIR}/tests/sonic_trt_inference_bridge.cpp)
+target_include_directories(sonic_trt_inference_bridge PUBLIC
+  ${EXE_INCLUDES}
+  ${PROJECT_SOURCE_DIR}/src)
+target_link_directories(sonic_trt_inference_bridge PRIVATE ${CUDA_LINK_DIRS})
+target_link_libraries(sonic_trt_inference_bridge PRIVATE ${PROJECT_NAME} ${EXE_LIBS})
+set_target_properties(
+  sonic_trt_inference_bridge
+  PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${PROJECT_SOURCE_DIR}/target/release/"
+             OUTPUT_NAME sonic_trt_inference_bridge
+             CXX_STANDARD 20
+             CXX_STANDARD_REQUIRED ON
+             CXX_EXTENSIONS OFF)
+
 # Setting our output directory and C++ standard
 set_target_properties(
   ${EXECUTABLE_NAME}

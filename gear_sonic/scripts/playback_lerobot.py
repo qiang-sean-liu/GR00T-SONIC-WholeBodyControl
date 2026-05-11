@@ -52,6 +52,7 @@ import os
 import pathlib
 import time
 from collections import deque
+from typing import Any
 
 import mujoco
 import mujoco.viewer
@@ -410,22 +411,37 @@ class SonicRunner:
     """
 
     def __init__(self, encoder_path: str, decoder_path: str, fps: float = 20.0,
-                 closed_loop: bool = True):
-        import onnxruntime as ort
-        providers = ["CUDAExecutionProvider", "CPUExecutionProvider"]
-        self._enc = ort.InferenceSession(encoder_path, providers=providers)
-        self._dec = ort.InferenceSession(decoder_path, providers=providers)
+                 closed_loop: bool = True, inference_backend: Any | None = None):
+        if inference_backend is None:
+            import onnxruntime as ort
+            providers = ["CUDAExecutionProvider", "CPUExecutionProvider"]
+            self._enc = ort.InferenceSession(encoder_path, providers=providers)
+            self._dec = ort.InferenceSession(decoder_path, providers=providers)
+
+            enc_in  = self._enc.get_inputs()[0].shape
+            dec_in  = self._dec.get_inputs()[0].shape
+            enc_out = self._enc.get_outputs()[0].shape
+            dec_out = self._dec.get_outputs()[0].shape
+            enc_in_dim = enc_in[1]
+            dec_in_dim = dec_in[1]
+            enc_out_dim = enc_out[1]
+            dec_out_dim = dec_out[1]
+            self._inference_backend = None
+        else:
+            self._enc = inference_backend.encoder_session
+            self._dec = inference_backend.decoder_session
+            enc_in_dim = inference_backend.encoder_input_dim
+            dec_in_dim = inference_backend.decoder_input_dim
+            enc_out_dim = inference_backend.token_dim
+            dec_out_dim = inference_backend.action_dim
+            self._inference_backend = inference_backend
         self._dt = 1.0 / fps
 
         # Validate model shapes
-        enc_in  = self._enc.get_inputs()[0].shape
-        dec_in  = self._dec.get_inputs()[0].shape
-        enc_out = self._enc.get_outputs()[0].shape
-        dec_out = self._dec.get_outputs()[0].shape
-        assert enc_in[1]  == _ENC_INPUT_DIM, f"Encoder expects {_ENC_INPUT_DIM} dims, got {enc_in[1]}"
-        assert dec_in[1]  == _DEC_INPUT_DIM, f"Decoder expects {_DEC_INPUT_DIM} dims, got {dec_in[1]}"
-        assert enc_out[1] == 64,             f"Encoder output must be 64 dims, got {enc_out[1]}"
-        assert dec_out[1] == 29,             f"Decoder output must be 29 dims, got {dec_out[1]}"
+        assert enc_in_dim == _ENC_INPUT_DIM, f"Encoder expects {_ENC_INPUT_DIM} dims, got {enc_in_dim}"
+        assert dec_in_dim == _DEC_INPUT_DIM, f"Decoder expects {_DEC_INPUT_DIM} dims, got {dec_in_dim}"
+        assert enc_out_dim == 64,            f"Encoder output must be 64 dims, got {enc_out_dim}"
+        assert dec_out_dim == 29,            f"Decoder output must be 29 dims, got {dec_out_dim}"
         print(f"  Encoder: {enc_in} → {enc_out}")
         print(f"  Decoder: {dec_in} → {dec_out}")
 
@@ -437,6 +453,9 @@ class SonicRunner:
         self._ang_vel_hist      = deque([np.zeros(3,   dtype=np.float32)] * _HISTORY_LEN, maxlen=_HISTORY_LEN)
         self._prev_base_quat    = np.array([1., 0., 0., 0.], dtype=np.float64)
         self._prev_joint_pos_il = np.zeros(29, dtype=np.float32)  # IsaacLab order
+        self._last_encoder_obs: np.ndarray | None = None
+        self._last_decoder_obs: np.ndarray | None = None
+        self._last_raw_action: np.ndarray | None = None
         # Closed-loop: previous policy output (IL order, deviation from default_angles).
         # None on the first step, then set to the scaled policy output so that
         # his_body_joint_positions and his_last_actions stay consistent (as in real deployment).
@@ -485,6 +504,48 @@ class SonicRunner:
         self._prev_base_quat    = base_quat_0.astype(np.float64).copy()
         self._prev_joint_pos_il = body29_il.copy()
         self._prev_policy_body29_il = body29_il.copy()
+
+    def sync_decoder_history_from_obs(self, decoder_obs: np.ndarray) -> None:
+        """Replace rolling decoder histories from a recorded decoder_obs tensor.
+
+        The decoder layout stores history oldest-first.  This is used at
+        recorded-warmup handoff so the first live decoder frame starts from the
+        same history window that the C++ deploy recorded.
+        """
+        dec_obs = decoder_obs.astype(np.float32, copy=False)
+
+        s, e = _DEC_OBS_LAYOUT["his_base_angular_velocity_10frame_step1"]
+        self._ang_vel_hist = deque(
+            [x.copy() for x in dec_obs[s:e].reshape(_HISTORY_LEN, 3)],
+            maxlen=_HISTORY_LEN,
+        )
+
+        s, e = _DEC_OBS_LAYOUT["his_body_joint_positions_10frame_step1"]
+        self._joint_pos_hist = deque(
+            [x.copy() for x in dec_obs[s:e].reshape(_HISTORY_LEN, 29)],
+            maxlen=_HISTORY_LEN,
+        )
+
+        s, e = _DEC_OBS_LAYOUT["his_body_joint_velocities_10frame_step1"]
+        self._joint_vel_hist = deque(
+            [x.copy() for x in dec_obs[s:e].reshape(_HISTORY_LEN, 29)],
+            maxlen=_HISTORY_LEN,
+        )
+
+        s, e = _DEC_OBS_LAYOUT["his_last_actions_10frame_step1"]
+        self._last_action_hist = deque(
+            [x.copy() for x in dec_obs[s:e].reshape(_HISTORY_LEN, 29)],
+            maxlen=_HISTORY_LEN,
+        )
+
+        s, e = _DEC_OBS_LAYOUT["his_gravity_dir_10frame_step1"]
+        self._gravity_hist = deque(
+            [x.copy() for x in dec_obs[s:e].reshape(_HISTORY_LEN, 3)],
+            maxlen=_HISTORY_LEN,
+        )
+
+        self._prev_joint_pos_il = self._joint_pos_hist[-1].copy()
+        self._prev_policy_body29_il = self._joint_pos_hist[-1].copy()
 
     # ------------------------------------------------------------------
     # Static helpers for offline playback
@@ -549,7 +610,9 @@ class SonicRunner:
              encoder_obs_rec:      np.ndarray | None = None,  # [1762] exact recorded encoder input
              token_rec:            np.ndarray | None = None,  # [64] exact recorded token_state
              decoder_obs_rec:      np.ndarray | None = None,  # [994] exact recorded decoder input
+             decoder_history_obs_rec: np.ndarray | None = None,  # [994] recorded history used to seed live decoder
              decoder_action_raw_rec: np.ndarray | None = None,  # [29] exact recorded decoder output
+             history_action_raw_rec: np.ndarray | None = None,  # [29] raw action to store for next history step
              q_target_cmd_rec:     np.ndarray | None = None,  # [29] exact recorded q_target command
              ) -> np.ndarray:
         """Run one encoder+decoder step.  Returns joint_targets_43 (43-DOF MuJoCo order).
@@ -619,14 +682,18 @@ class SonicRunner:
             token = token_rec.astype(np.float32, copy=False)
         else:
             token = self._enc.run(None, {"obs_dict": enc_obs[np.newaxis]})[0][0]  # [64]
+        self._last_encoder_obs = enc_obs.copy()
 
         # ---- 4. Update decoder history buffers (PAST, oldest first) ---------
-        self._ang_vel_hist.append(ang_vel)
-        self._joint_pos_hist.append(body29_il)
-        self._joint_vel_hist.append(body29_vel_il)
-        self._gravity_hist.append(gravity_body)
-        # last_action: store the raw policy output from the previous step
-        # (populated after inference; first frame uses zeros — already in deque)
+        if decoder_history_obs_rec is not None:
+            self.sync_decoder_history_from_obs(decoder_history_obs_rec)
+        else:
+            self._ang_vel_hist.append(ang_vel)
+            self._joint_pos_hist.append(body29_il)
+            self._joint_vel_hist.append(body29_vel_il)
+            self._gravity_hist.append(gravity_body)
+            # last_action: store the raw policy output from the previous step
+            # (populated after inference; first frame uses zeros — already in deque)
 
         # ---- 5. Build/consume decoder obs [994] ------------------------------
         if decoder_obs_rec is not None:
@@ -657,20 +724,31 @@ class SonicRunner:
             for fi, gd in enumerate(self._gravity_hist):
                 dec_obs[s + fi*3 : s + (fi+1)*3] = gd
 
+        self._last_decoder_obs = dec_obs.copy()
+
         # ---- 6. Run decoder or consume recorded output -----------------------
         if decoder_action_raw_rec is not None:
             raw_action = decoder_action_raw_rec.astype(np.float32, copy=False)
         else:
             raw_action = self._dec.run(None, {"obs_dict": dec_obs[np.newaxis]})[0][0]  # [29]
+        self._last_raw_action = raw_action.astype(np.float32, copy=True)
 
-        # Store raw action in history (for next step)
-        self._last_action_hist.append(raw_action.astype(np.float32))
+        # Store raw action in history for the next step.  The C++ teleop logs
+        # last_action before inference, then updates it from TensorRT output
+        # after inference.  For replay diagnostics we can therefore roll the
+        # recorded TensorRT action while still running Python inference now.
+        history_action = raw_action if history_action_raw_rec is None else history_action_raw_rec
+        self._last_action_hist.append(history_action.astype(np.float32))
 
         # ---- 7. Post-process: remap + scale + default_angles ----------------
         if q_target_cmd_rec is not None:
             joint_targets_mujoco29 = q_target_cmd_rec.astype(np.float64, copy=False)
         else:
-            joint_targets_mujoco29 = _DEFAULT_ANGLES + raw_action[_ISAACLAB_TO_MUJOCO] * _ACTION_SCALE
+            # Teleop stores MotorCommand::q_target as float, so mirror that
+            # cast when replay computes targets from a freshly inferred action.
+            joint_targets_mujoco29 = (
+                _DEFAULT_ANGLES + raw_action[_ISAACLAB_TO_MUJOCO] * _ACTION_SCALE
+            ).astype(np.float32).astype(np.float64)
 
         # ---- 8. Update state for next step ----------------------------------
         self._prev_base_quat = base_quat.copy()
