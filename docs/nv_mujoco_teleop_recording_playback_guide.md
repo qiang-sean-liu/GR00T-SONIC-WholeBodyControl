@@ -15,23 +15,25 @@ cd /home/horizon/wrk/SONIC/GR00T-WholeBodyControl
 For standard simulation data collection with camera publishing:
 
 ```bash
+cd /home/horizon/wrk/SONIC/GR00T-WholeBodyControl
 source .venv_sim/bin/activate
-python gear_sonic/scripts/run_sim_loop.py \
-  --enable-image-publish \
-  --enable-offscreen \
-  --camera-port 5555
+python gear_sonic/scripts/run_sim_loop.py --enable-image-publish --enable-offscreen --camera-port 5555
 ```
 
 For the current table / object setup, use the PICO bringup wrapper if the local `pnp_cube` XML/head-camera scene is needed:
 
 ```bash
+cd /home/horizon/wrk/SONIC/GR00T-WholeBodyControl
 source .venv_sim/bin/activate
-python gear_sonic/scripts/run_sim_loop_pico_bringup.py \
-  --env_name pnp_cube \
-  --head_cam \
-  --enable_image_publish \
-  --enable_offscreen \
-  --camera-port 5555
+python gear_sonic/scripts/run_sim_loop_pico_bringup.py --env-name pnp_cube --head-cam --enable-image-publish --enable-offscreen --camera-port 5555
+```
+
+For randomized plate/cube data collection in the default scene, use the randomized wrapper:
+
+```bash
+cd /home/horizon/wrk/SONIC/GR00T-WholeBodyControl
+source .venv_sim/bin/activate
+python gear_sonic/scripts/run_sim_loop_random_plate_cube.py --enable-image-publish --enable-offscreen --camera-port 5555
 ```
 
 What this starts:
@@ -52,15 +54,10 @@ Important details:
 For simulation:
 
 ```bash
-cd gear_sonic_deploy
-./deploy.sh --input-type manager --output-type all sim
-```
-
-Equivalent command seen in earlier runs:
-
-```bash
-cd gear_sonic_deploy
-./deploy.sh sim --input-type zmq_manager
+cd /home/horizon/wrk/SONIC/GR00T-WholeBodyControl/gear_sonic_deploy
+source scripts/setup_env.sh
+./deploy.sh --input-type zmq_manager sim
+# Wait until you see "Init done"
 ```
 
 The current `deploy.sh` defaults are:
@@ -92,12 +89,9 @@ Operator action:
 Use the PICO manager streamer for calibration and teleoperation input:
 
 ```bash
+cd /home/horizon/wrk/SONIC/GR00T-WholeBodyControl
 source .venv_teleop/bin/activate
-python gear_sonic/scripts/pico_manager_thread_server.py \
-  --manager \
-  --waist_tracking \
-  --vis_vr3pt \
-  --vis_smpl
+python gear_sonic/scripts/pico_manager_thread_server.py --manager --waist_tracking --vis_vr3pt --vis_smpl
 ```
 
 What this provides:
@@ -121,58 +115,48 @@ There are three relevant exporter levels on this branch.
 Original SONIC data recording:
 
 ```bash
+cd /home/horizon/wrk/SONIC/GR00T-WholeBodyControl
 source .venv_data_collection/bin/activate
-python gear_sonic/scripts/run_data_exporter.py \
-  --task-prompt "pick up the object" \
-  --data-collection-frequency 50 \
-  --camera-host localhost \
-  --camera-port 5555
+python gear_sonic/scripts/run_data_exporter.py --task-prompt "pick up the object" --data-collection-frequency 50 --camera-host localhost --camera-port 5555
+```
+
+Original SONIC data recording with per-episode scene XML snapshots:
+
+```bash
+cd /home/horizon/wrk/SONIC/GR00T-WholeBodyControl
+source .venv_data_collection/bin/activate
+python gear_sonic/scripts/run_data_exporter_original_record_scene_xml.py --task-prompt "walk to the cube, pick it up, walk to the plate, and place the cube on the plate" --camera-host localhost --camera-port 5565
 ```
 
 LowCmd / MuJoCo debug recording:
 
 ```bash
+cd /home/horizon/wrk/SONIC/GR00T-WholeBodyControl
 source .venv_data_collection/bin/activate
-python gear_sonic/scripts/run_data_exporter_lowcmd.py \
-  --task-prompt "pick up the object" \
-  --data-collection-frequency 50 \
-  --camera-host localhost \
-  --camera-port 5555 \
-  --state-zmq-host localhost \
-  --state-zmq-port 5557 \
-  --base-state-zmq-host localhost \
-  --base-state-zmq-port 5558
+python gear_sonic/scripts/run_data_exporter_lowcmd.py --task-prompt "pick up the object" --data-collection-frequency 50 --camera-host localhost --camera-port 5555 --state-zmq-host localhost --state-zmq-port 5557 --base-state-zmq-host localhost --base-state-zmq-port 5558
 ```
 
 ONNX inputs + LowCmd + MuJoCo substep debug recording:
 
 ```bash
+cd /home/horizon/wrk/SONIC/GR00T-WholeBodyControl
 source .venv_data_collection/bin/activate
-python gear_sonic/scripts/run_data_exporter_onnx_inputs.py \
-  --dataset-name onnx-inputs-debug \
-  --task-prompt "pick up the object" \
-  --data-collection-frequency 50 \
-  --camera-host localhost \
-  --camera-port 5555 \
-  --state-zmq-host localhost \
-  --state-zmq-port 5557 \
-  --base-state-zmq-host localhost \
-  --base-state-zmq-port 5558
+python gear_sonic/scripts/run_data_exporter_onnx_inputs.py --dataset-name onnx-inputs-debug --task-prompt "pick up the object" --data-collection-frequency 50 --camera-host localhost --camera-port 5555 --state-zmq-host localhost --state-zmq-port 5557 --base-state-zmq-host localhost --base-state-zmq-port 5558
 ```
 
 What to use:
 
 - Use `run_data_exporter.py` for ordinary SONIC dataset recording.
+- Use `run_data_exporter_original_record_scene_xml.py` for ordinary SONIC recording when the random plate/cube scene XML must be saved with each episode.
 - Use `run_data_exporter_lowcmd.py` when you need `LowCmd`, body/hand command fields, MuJoCo qpos/qvel, and timing debug.
 - Use `run_data_exporter_onnx_inputs.py` when you need exact C++ SONIC encoder / decoder inputs and outputs for ONNX playback diagnosis.
 
 ### Terminal 5: Camera View
 
 ```bash
+cd /home/horizon/wrk/SONIC/GR00T-WholeBodyControl
 source .venv_data_collection/bin/activate
-python gear_sonic/scripts/run_camera_viewer.py \
-  --camera-host localhost \
-  --camera-port 5555
+python gear_sonic/scripts/run_camera_viewer.py --camera-host localhost --camera-port 5555
 ```
 
 Controls:
@@ -467,6 +451,14 @@ However, in the Frame 12 investigation, the first meaningful divergence was caus
 - Python client for a persistent C++ TensorRT inference subprocess.
 - Provides ONNXRuntime-like `run()` adapters for encoder and decoder playback.
 
+### Simulation Launchers
+
+`gear_sonic/scripts/run_sim_loop_random_plate_cube.py`
+
+- Starts the default simulator scene, which already contains `plate_body` and `cube_body`.
+- On every Backspace reset, calls normal MuJoCo reset and then randomizes only `plate_body` and `cube_body` table-top positions.
+- Keeps the robot, table, cameras, and all other scene bodies unchanged across resets.
+
 ### C++ Debug / Replay Additions
 
 `gear_sonic_deploy/src/g1/g1_deploy_onnx_ref/src/g1_deploy_onnx_ref.cpp`
@@ -644,18 +636,13 @@ cmake --build gear_sonic_deploy/build --target replay_policy_engine_decoder_test
 The next planned data collection is:
 
 ```text
-Start data collection with randomized plate and apple positions on the table.
+Start data collection with randomized plate and cube positions on the table.
 ```
 
-Recommended setup:
+Randomization design:
 
-- Use the ONNX inputs debug exporter so the next dataset keeps the exact same diagnostic coverage:
-  - LowCmd fields
-  - MuJoCo substep fields
-  - C++ encoder / decoder inputs
-  - C++ decoder raw action and final q target
-- Add or configure randomization in the table scene before recording:
-  - random plate position
-  - random apple position
-  - keep the random seed / sampled object positions in metadata if possible
+- Every time the operator presses the Backspace reset button, reset the scene and randomize only the plate and cube positions on the table.
+- Keep the rest of the scene unchanged across resets.
+- The randomized plate and cube positions should be different each reset while remaining valid table-top placements.
+- If possible, store the sampled plate/cube positions or random seed in the recording metadata so the episode can be reproduced later.
 

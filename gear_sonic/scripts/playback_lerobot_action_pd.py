@@ -37,6 +37,7 @@ import os
 import time
 from pathlib import Path
 
+import cv2
 import mujoco
 import mujoco.viewer
 import numpy as np
@@ -632,6 +633,9 @@ def playback_action_pd(
     init_substep_index: int = 0,
     init_substep_all_inputs: bool = False,
     start_frame: int = 0,
+    output_video: str | None = None,
+    video_width: int = 1280,
+    video_height: int = 720,
 ) -> None:
     rec = _load_action_episode(dataset_dir, episode)
     states = rec["states"]
@@ -908,6 +912,8 @@ def playback_action_pd(
     )
 
     viewer = None
+    renderer = None
+    video_writer = None
     if not no_viewer:
         viewer = mujoco.viewer.launch_passive(
             model, data, show_left_ui=False, show_right_ui=False
@@ -922,6 +928,22 @@ def playback_action_pd(
                 viewer.cam.azimuth = 135
             except Exception:
                 pass
+    if output_video is not None:
+        output_path = Path(output_video)
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        renderer = mujoco.Renderer(model, height=video_height, width=video_width)
+        fourcc = cv2.VideoWriter_fourcc(*"mp4v")
+        video_writer = cv2.VideoWriter(str(output_path), fourcc, fps, (video_width, video_height))
+        if not video_writer.isOpened():
+            raise RuntimeError(f"Failed to open output video writer: {output_path}")
+        print(f"Saving playback video to {output_path}")
+
+    def write_video_frame() -> None:
+        if renderer is None or video_writer is None:
+            return
+        renderer.update_scene(data)
+        rgb = renderer.render()
+        video_writer.write(cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR))
 
     zero29 = np.zeros(29, dtype=np.float64)
 
@@ -979,6 +1001,7 @@ def playback_action_pd(
 
                 if viewer is not None and viewer.is_running():
                     viewer.sync()
+                write_video_frame()
                 if debug and (i < start_frame + 10 or (i + 1) % 100 == 0 or i == total_frames - 1):
                     print(f"  Frame {i + 1}/{total_frames}  time={data.time:.6f}")
                 elif i < start_frame + 10 or (i + 1) % 100 == 0 or i == total_frames - 1:
@@ -1094,6 +1117,7 @@ def playback_action_pd(
 
             if viewer is not None and viewer.is_running():
                 viewer.sync()
+            write_video_frame()
 
             if debug and (i < 10 or (i + 1) % 100 == 0 or i == total_frames - 1):
                 sim_body29 = data.qpos[model.jnt_qposadr[body_jids]]
@@ -1124,6 +1148,10 @@ def playback_action_pd(
     finally:
         if viewer is not None:
             viewer.close()
+        if video_writer is not None:
+            video_writer.release()
+        if renderer is not None:
+            renderer.close()
 
 
 def main() -> None:
@@ -1249,6 +1277,13 @@ def main() -> None:
         help="First recorded frame to play back.",
     )
     parser.add_argument(
+        "--output_video",
+        default=None,
+        help="Optional MP4 path. If set, records offscreen playback frames to this file.",
+    )
+    parser.add_argument("--video_width", type=int, default=1280, help="Output video width.")
+    parser.add_argument("--video_height", type=int, default=720, help="Output video height.")
+    parser.add_argument(
         "--elastic_band",
         action="store_true",
         help="Apply the same ElasticBand external root support force used by live MuJoCo sim.",
@@ -1285,6 +1320,9 @@ def main() -> None:
         init_substep_index=args.init_substep_index,
         init_substep_all_inputs=args.init_substep_all_inputs,
         start_frame=args.start_frame,
+        output_video=args.output_video,
+        video_width=args.video_width,
+        video_height=args.video_height,
     )
 
 
