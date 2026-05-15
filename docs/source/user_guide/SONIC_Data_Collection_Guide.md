@@ -22,6 +22,8 @@ Complete the [Quick Start](../getting_started/quickstart), [PICO Setup](../getti
 
 Recording is controlled directly from the PICO headset — no keyboard interaction needed.
 
+For implementation details on receiving PICO data via ZMQ and streaming MuJoCo images back to the headset, see [SONIC ZMQ And PICO Image Streaming Implementation](SONIC_ZMQ_PICO_Image_Streaming_Implementation.md).
+
 ---
 
 ## Lower Body Control Modes
